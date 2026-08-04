@@ -13,7 +13,12 @@ The MCP App server renders draw.io diagrams **inline** in AI chat interfaces usi
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `xml` | string | Yes | draw.io XML in mxGraphModel format |
+| `xml` | string | One of `xml` / `mermaid` | draw.io XML in mxGraphModel format. Mutually exclusive with `mermaid`. |
+| `mermaid` | string | One of `xml` / `mermaid` | Mermaid.js diagram definition (26 supported diagram types — flowchart, sequence, class, state, ER, gantt, mindmap, timeline, quadrant, C4, architecture, …). Parsed and laid out natively, then converted to draw.io. Mutually exclusive with `xml`. |
+| `postLayout` | enum | No | Optional ELK layered-flow pass applied after render. Only value: `"elk"`. Vertex positions are replaced; only edge topology survives. |
+| `direction` | enum | No | XML-only flow direction for `postLayout: "elk"`: `"vertical"` (default) or `"horizontal"`. Ignored for Mermaid (direction comes from the `flowchart TD/LR` code). |
+
+Provide exactly one of `xml` or `mermaid` as a plain string — not an object or array.
 
 The rendered diagram includes:
 - Interactive zoom, pan, and navigation
@@ -29,7 +34,29 @@ The official draw.io MCP App server is hosted at:
 https://mcp.draw.io/mcp
 ```
 
-Add this URL as a remote MCP server in Claude.ai or any MCP Apps-compatible host — no installation or setup required.
+Add this URL as a remote MCP server in Claude.ai, Cursor, or any MCP Apps-compatible host — no installation or setup required.
+
+> **Note:** This server renders diagrams **inline** via the [MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) protocol, so it requires an MCP Apps–capable host (e.g. Claude.ai or Cursor). In hosts that don't support MCP Apps — such as **VS Code / GitHub Copilot** or Claude Code — the tool connects but has nothing to render, so the diagram won't appear. For those clients use the stdio [`@drawio/mcp`](../mcp-tool-server) tool server instead, which opens diagrams in the browser. ChatGPT isn't supported yet: its connectors are remote-only and use OpenAI's own widget format rather than MCP Apps, so the diagram won't render inline — and unlike the editors above, the stdio fallback can't be used.
+
+### Using with Cursor
+
+Cursor supports the MCP Apps extension (Cursor **≥ 2.6**), so diagrams render inline in the Agent chat. On older builds the server still connects, but there's nothing to render inline; use the stdio [`@drawio/mcp`](../mcp-tool-server) tool server instead, which opens diagrams in the browser.
+
+[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=drawio&config=eyJ1cmwiOiJodHRwczovL21jcC5kcmF3LmlvL21jcCJ9)
+
+Click the button above for one-click install, or add the hosted endpoint manually to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "drawio": {
+      "url": "https://mcp.draw.io/mcp"
+    }
+  }
+}
+```
+
+Enable the server when prompted (or under **Cursor Settings → MCP**), then ask the Agent to create a diagram.
 
 ## Self-Hosting
 
@@ -112,7 +139,32 @@ This starts a local Workers dev server at `http://localhost:8787/mcp`.
 |---|---|---|
 | **Transport** | `StreamableHTTPServerTransport` (Express) | `WebStandardStreamableHTTPServerTransport` (Web Standard `Request`/`Response`) |
 | **HTML build** | Reads bundles from `node_modules` at startup | Pre-built at deploy time via `src/build-html.js` → `src/generated-html.js` |
-| **Schema validation** | Default (Zod-based) | Uses `@cfworker/json-schema` (Workers-compatible) |
+| **Schema validation** | Default (Zod-based) | Default (Zod-based) |
+
+## Publishing to the MCP Registry
+
+The hosted server is listed in the [MCP Community Registry](https://github.com/modelcontextprotocol/registry) as **`io.draw/mcp`**, defined by [`server.json`](server.json) in this directory. The community registry feeds downstream surfaces such as [GitHub's MCP Registry](https://github.com/mcp) and VS Code's *MCP: Browse Servers* (GitHub additionally curates what it features on its own page).
+
+**One-time setup** — prove ownership of the `draw.io` domain. Generate a keypair (macOS's system LibreSSL lacks Ed25519 — use Homebrew OpenSSL 3) and publish the public key as a DNS TXT record:
+
+```bash
+brew install mcp-publisher openssl@3
+OPENSSL=/opt/homebrew/opt/openssl@3/bin/openssl
+$OPENSSL genpkey -algorithm Ed25519 -out ~/.drawio-mcp-registry-key.pem
+echo "draw.io. IN TXT \"v=MCPv1; k=ed25519; p=$($OPENSSL pkey -in ~/.drawio-mcp-registry-key.pem -pubout -outform DER | tail -c 32 | base64)\""
+```
+
+Add the printed TXT record on the **apex** of `draw.io` (record name `@` in Cloudflare DNS — not under a selector like `_mcp-auth`, which the registry will not see). Keep the key file for future publishes, and keep it outside the repository; losing it only means generating a new key and replacing the TXT record (remove the stale record — leftovers are tried first and break verification).
+
+**Publish / update** — bump `version` in `server.json` first (kept in lockstep with `package.json`), then from this directory:
+
+```bash
+OPENSSL=/opt/homebrew/opt/openssl@3/bin/openssl
+mcp-publisher login dns --domain draw.io --private-key "$($OPENSSL pkey -in ~/.drawio-mcp-registry-key.pem -noout -text | grep -A3 'priv:' | tail -n +2 | tr -d ' :\n')"
+mcp-publisher publish
+```
+
+The `io.draw` namespace is the reverse-DNS form of the verified `draw.io` domain (the same pattern as the registry's own `io.modelcontextprotocol/everything`). The alternative would be `io.github.jgraph/...` via `mcp-publisher login github`, but that requires jgraph org-owner rights and gives up the brand naming.
 
 ## Architecture
 

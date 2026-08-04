@@ -10,20 +10,27 @@ Renders draw.io diagrams inline in AI chat interfaces using the MCP Apps protoco
 | `src/index.js` | Node.js entry (Express + stdio transports) |
 | `src/worker.js` | Cloudflare Workers entry (Web Standard fetch handler) |
 | `src/build-html.js` | Build script: generates `generated-html.js` for the Worker |
+| `server.json` | MCP Community Registry manifest (`io.draw/mcp`, remote `https://mcp.draw.io/mcp`) — publish runbook in README "Publishing to the MCP Registry"; keep `version` in lockstep with `package.json` |
 
 ## Architecture
 
 ### How the HTML is built
 
-At startup (Node.js) or build time (Workers), the following bundles are inlined into a self-contained HTML string:
+At startup (Node.js) or build time (Workers), the HTML is assembled. The draw.io **viewer**, **drawio-elk**, and **drawio-mermaid** load from the `viewer.diagrams.net` CDN via `<script src>` — they're large, cached cross-session by the browser, and stay version-synced with each draw.io release (same host + release cadence as the viewer). The remaining bundles are inlined so the sandboxed iframe needs no further fetches for them:
 
 - **`app-with-deps.js`** (~319 KB, from `node_modules/@modelcontextprotocol/ext-apps`) — MCP Apps SDK browser bundle. The bundle is ESM (ends with `export { ... as App }`), so `processAppBundle()` strips the export statement and creates a local `var App = <minifiedName>` alias. This makes it safe to inline in a plain `<script>` tag inside the sandboxed iframe.
 - **`pako_deflate.min.js`** (~28 KB, from `node_modules/pako`) — for compressing XML into the `#create=` URL format.
-- **`vendor/mermaid/drawio-mermaid.min.js`** (~454 KB) — native Mermaid parser + layout that emits draw.io cells via `mxMermaidToDrawio.parseText(text, config)`. Replaces the upstream ~2.7 MB `mermaid.min.js` + `extensions.min.js` runtime the client previously lazy-loaded from `app.diagrams.net`. Supports 26 diagram types. Reads `globalThis.ELK` on init. Built from `jgraph/drawio-mermaid` (drawio-dev submodule under `modules/drawio-mermaid`). Version is embedded as a banner on the file's first line — see `vendor/mermaid/README.md`.
-- **`vendor/elk/drawio-elk.min.js`** (~772 KB) — Eclipse Layout Kernel, IIFE bundle. Defines `var ELK` (visible as `globalThis.ELK`) consumed by drawio-mermaid and the `postLayout` pass. Built from `jgraph/drawio-elk` (drawio-dev submodule under `modules/drawio-elk`). Version is embedded as a banner on the file's first line — see `vendor/elk/README.md`.
-- **`vendor/elk/mxElkLayout.js`** — mxGraph wrapper around ELK (`buildElkGraph`, `applyElkLayout`, `executeAsync`). Powers the optional `postLayout` parameter on `create_diagram`. Vendored from drawio-dev `origin/elk-layout` branch; see `vendor/elk/README.md` for refresh instructions.
+- **libavoid** (the obstacle-avoiding orthogonal edge router behind `routing: "libavoid"`) is **not vendored/inlined** — the HTML loads the pure-JS router bundle (`libavoid.min.js`, a self-contained classic script that publishes `globalThis.Avoid` and parks `window.__libavoidReady` synchronously — no WASM, no fetch, no `wasm-unsafe-eval` needed) + shared routing core from the `viewer.diagrams.net` CDN (`js/libavoid-js/`), like drawio-elk and drawio-mermaid. Requires the draw.io release that ships the pure-JS two-file layout there. The routing math is `AvoidRouting.computeRoutes` from `libavoid-routing.js` — the canonical `drawio-dev js/libavoid-js/` artifact, byte-identical to what the draw.io editor bundles and the mcp-tool-server vendors. `buildHtml` accepts `options.libavoidJs` to inline a local build instead (dev). See `vendor/libavoid/README.md`.
 
-The draw.io viewer (`viewer-static.min.js`) is loaded from CDN at runtime. Script load order is `viewer → pako → elk → mermaid → mxElkLayout`: drawio-elk defines `var ELK` and must come before drawio-mermaid (mermaid reads `globalThis.ELK` on init and throws otherwise); mermaid must come after the viewer so its `mermaidShapes.js` side-effect sees `mxCellRenderer`/`mxActor`; mxElkLayout consumes mxGraph + ELK last.
+Loaded from the CDN (not inlined):
+
+- **`viewer-static.min.js`** — the draw.io viewer (`GraphViewer`, `Graph`, `mxCodec`, `mxUtils`, …).
+- **`drawio-mermaid.min.js`** (`/js/mermaid/`) — native Mermaid parser + layout that emits draw.io cells via `mxMermaidToDrawio.parseText(text, config)`. Replaces the upstream ~2.7 MB `mermaid.min.js` + `extensions.min.js` runtime. Supports 26 diagram types. Reads `globalThis.ELK` on init. Built from `jgraph/drawio-mermaid`.
+- **`drawio-elk.min.js`** (`/js/elk/`) — Eclipse Layout Kernel + the mxGraph ↔ ELK bridge, self-publishing IIFE. Defines `var ELK` (engine) plus `ElkLayout` / `ElkAdapter` / `ElkApplier` as globals, consumed by drawio-mermaid and the `postLayout` pass. `ElkLayout` is the single source for the layout pipeline (`prepare`/`execute`), the per-algorithm `DEFAULTS`, the `MENU_PRESETS` (layout name → algorithm + direction) and the `CANONICAL_EDGE` treatment (`edgeStyleMode` + `corners`) — shared verbatim with drawio-dev's editor. The MCP's `applyPostLayout` drives it via `new ElkLayout(...).prepare(...)`. Built from `jgraph/drawio-elk`.
+
+Script load order is `viewer → pako → elk → mermaid`, preserved because all are classic (non-async) `<script>` tags and execute in document order — external CDN tags block parsing just like inline ones. drawio-elk defines `var ELK` + `ElkLayout` and must come before drawio-mermaid (mermaid reads `globalThis.ELK` on init and throws otherwise); mermaid must come after the viewer so its `mermaidShapes.js` side-effect sees `mxCellRenderer`/`mxActor`. The viewer code reaches `ElkLayout` straight off the (CDN-loaded) bundle for the `postLayout` pass — no separate shim script.
+
+For local dev, set `VIEWER_PATH` / `ELK_PATH` / `MERMAID_PATH` to a built bundle to inline it instead of hitting the CDN (e.g. testing a drawio-elk/mermaid build before it's published). `processElkBundle` / `processMermaidBundle` accept both the published IIFE form and an ESM build. The published CDN files self-publish their globals (no `export{}`), so those functions are no-ops on them.
 
 ### Sandbox constraints
 
@@ -89,7 +96,9 @@ Returns `null` for unsupported diagram types — the wrapper converts that to a 
 
 ## Shape Search Index
 
-The `search_shapes` tool uses a pre-built index from `shape-search/search-index.json` (~10,000 shapes). The index is embedded in `generated-html.js` at build time (adds ~4 MB to the Worker bundle). The search runs in-process — no external HTTP calls. The tag lookup map is built once per session when `createServer()` is called. If the index file is missing, `search_shapes` is silently not registered.
+The `search_shapes` tool uses a pre-built index from `shape-search/search-index.json` (~10,000 shapes). The index is embedded in `generated-html.js` at build time (adds ~4 MB to the Worker bundle). The local search runs in-process; the tag lookup map is built once per session when `createServer()` is called. If the index file is missing, `search_shapes` is silently not registered.
+
+When the local index has no strong match for a query (no result exact-matched every term), results are supplemented live from the draw.io icon service (`icons.diagrams.net` — brand logos and general-purpose concept icons, returned as `shape=image` styles). The merge pipeline is `searchShapesAndIcons` in `shared/icon-search.js`: strong local results lead and icons only fill spare slots; weak (Soundex/OR-fallback) local results keep at most half the budget. A full page of strong local results makes no network request; a service failure degrades to local-only results. The endpoint is configurable via `createServer`'s `iconServiceUrl` option, wired to `DRAWIO_ICON_SERVICE_URL` in both entries (set to `off` to disable). `https://icons.diagrams.net` is whitelisted in the iframe CSP `resourceDomains` so the referenced icon images render in the inline viewer.
 
 ## Coding Conventions
 

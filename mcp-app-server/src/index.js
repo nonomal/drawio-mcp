@@ -5,8 +5,41 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildHtml, processAppBundle, processMermaidBundle, processElkBundle, createServer } from "./shared.js";
+import { resolveIconServiceUrl } from "../../shared/icon-search.js";
+import { libavoidUrls } from "./libavoid-versions.js";
+
+// Build identifier: git SHA + ISO timestamp + "-dirty" if uncommitted
+// changes. Same logic as build-html.js — kept in sync for the Node
+// path which doesn't go through the prebuild step.
+function getBuildId()
+{
+  var sha = "no-git";
+  var dirty = "";
+
+  try
+  {
+    sha = execSync("git rev-parse --short HEAD", { cwd: path.dirname(fileURLToPath(import.meta.url)), stdio: ["pipe", "pipe", "ignore"] }).toString().trim();
+
+    try
+    {
+      var status = execSync("git status --porcelain", { cwd: path.dirname(fileURLToPath(import.meta.url)), stdio: ["pipe", "pipe", "ignore"] }).toString().trim();
+
+      if (status)
+      {
+        dirty = "-dirty";
+      }
+    }
+    catch (e) {}
+  }
+  catch (e) {}
+
+  return sha + dirty + "@" + new Date().toISOString();
+}
+
+const buildId = getBuildId();
 
 // Read the browser bundles once at startup and inline them into the HTML
 const extAppsEntry = fileURLToPath(import.meta.resolve("@modelcontextprotocol/ext-apps/app-with-deps"));
@@ -26,26 +59,42 @@ const pakoDeflateJs = fs.readFileSync(
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Inline the drawio-elk bundle (Eclipse Layout Kernel, ~790 KB). Ships as
-// ESM with a default export (the ELK class); processElkBundle strips the
-// export and aliases it to `var ELK` so it ends up on globalThis (consumed
-// by drawio-mermaid and mxElkLayout). MUST be loaded before drawio-mermaid.
-const elkJs = processElkBundle(fs.readFileSync(
-  path.join(__dirname, "..", "vendor", "elk", "drawio-elk.min.js"), "utf-8"
-));
+// drawio-elk (Eclipse Layout Kernel + mxGraph bridge) and drawio-mermaid
+// (native Mermaid parser + layout) load from the viewer.diagrams.net CDN by
+// default — see buildHtml. For testing a local build before it's published,
+// set ELK_PATH / MERMAID_PATH to a built bundle and it's inlined instead.
+// processElkBundle/processMermaidBundle accept both the published IIFE form
+// and an ESM build (exports stripped + aliased to globals). Example:
+//   ELK_PATH=../drawio-dev/src/main/webapp/js/elk/drawio-elk.min.js npm start
+var elkJs = null;
 
-// Inline the drawio-mermaid bundle (native Mermaid parser + layout, replaces
-// the upstream ~2.7 MB mermaid.min.js + extensions.min.js runtime). Ships as
-// ESM since the recent dist refactor; processMermaidBundle strips the export
-// and aliases `mxMermaidToDrawio` to a global the viewer code can call.
-const mermaidJs = processMermaidBundle(fs.readFileSync(
-  path.join(__dirname, "..", "vendor", "mermaid", "drawio-mermaid.min.js"), "utf-8"
-));
+if (process.env.ELK_PATH)
+{
+  elkJs = processElkBundle(fs.readFileSync(path.resolve(process.env.ELK_PATH), "utf-8"));
+  console.log("Inlining local drawio-elk from", process.env.ELK_PATH);
+}
 
-// Inline the mxElkLayout wrapper (vendored from drawio-dev origin/elk-layout
-// — see vendor/elk/README.md). Powers the optional postLayout pass on
-// create_diagram.
-const mxElkLayoutJs = fs.readFileSync(path.join(__dirname, "..", "vendor", "elk", "mxElkLayout.js"), "utf-8");
+var mermaidJs = null;
+
+if (process.env.MERMAID_PATH)
+{
+  mermaidJs = processMermaidBundle(fs.readFileSync(path.resolve(process.env.MERMAID_PATH), "utf-8"));
+  console.log("Inlining local drawio-mermaid from", process.env.MERMAID_PATH);
+}
+
+// libavoid (obstacle-avoiding edge router, powers the routing: "libavoid"
+// pass) is NOT inlined — the HTML loads the pure-JS router bundle + shared
+// routing core from the viewer.diagrams.net CDN, like drawio-elk and
+// drawio-mermaid (see buildHtml's libavoidBlock). Cached cross-session,
+// version-synced with each draw.io release, and drops ~850 KB from the HTML.
+// The URLs are ETag-versioned at startup (and daily on the HTTP transport)
+// so a release busts the CDN's 30-day browser cache immediately — see
+// libavoid-versions.js; on a failed startup check the plain URLs are used.
+// Deliberate startup cost: up to one HEAD timeout (~5s) when the CDN is
+// blackholed — bounded and rare (plain offline fails fast); resolving in
+// the background instead would leave the once-built stdio HTML permanently
+// unversioned.
+var libavoidScriptUrls = await libavoidUrls();
 
 // Optionally inline a local viewer build (for testing GraphViewer changes).
 // Set VIEWER_PATH env var to the path of viewer-static.min.js (or a directory
@@ -102,10 +151,17 @@ if (fs.existsSync(shapeIndexPath))
   console.log("Shape index: " + shapeIndex.length + " shapes");
 }
 
-// Pre-build the HTML once. The build version timestamp is baked into
-// the HTML so the iframe can log it on startup (visible in DevTools).
-const buildVersion = "drawio-mcp-" + new Date().toISOString();
-const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { viewerJs, elkJs, mxElkLayoutJs, buildVersion });
+// Icon service supplementing sparse search_shapes results. Override with
+// DRAWIO_ICON_SERVICE_URL (a self-hosted service base URL, or "off" to
+// disable icon supplementation entirely).
+const iconServiceUrl = resolveIconServiceUrl(process.env.DRAWIO_ICON_SERVICE_URL);
+
+// Pre-build the HTML once. The buildId is baked into the HTML so the
+// iframe exposes it via window.__DRAWIO_BUILD (visible in DevTools).
+// `let` — the daily libavoid version check rebuilds it in place (each
+// /mcp request creates its McpServer from the current value).
+let html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs,
+  { viewerJs, elkJs, buildId, libavoidUrls: libavoidScriptUrls });
 
 // --- Transport setup ---
 
@@ -117,6 +173,27 @@ async function startStreamableHTTPServer()
     ? process.env.ALLOWED_HOSTS.split(",").map(function(h) { return h.trim(); })
     : undefined;
   const app = createMcpExpressApp({ host: "0.0.0.0", allowedHosts });
+
+  // Re-check the libavoid CDN ETags daily and rebuild the HTML when a
+  // draw.io release changed them — each /mcp request creates its McpServer
+  // from the current html, so new sessions pick the fresh URLs up
+  // immediately. unref() keeps the timer from holding the process open.
+  setInterval(async function()
+  {
+    try
+    {
+      const urls = await libavoidUrls(libavoidScriptUrls);
+
+      if (urls.join("\n") !== libavoidScriptUrls.join("\n"))
+      {
+        libavoidScriptUrls = urls;
+        html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs,
+          { viewerJs, elkJs, buildId, libavoidUrls: urls });
+        console.log("libavoid CDN versions changed; HTML rebuilt");
+      }
+    }
+    catch (e) {}
+  }, 24 * 60 * 60 * 1000).unref();
 
   // Serve favicon
   const faviconPath = path.join(__dirname, "..", "favicon.png");
@@ -133,37 +210,13 @@ async function startStreamableHTTPServer()
     const start = Date.now();
     console.log(`[req] ${req.method} method=${method || "(none)"} session=${sessionId} accept=${req.headers["accept"] || ""}`);
 
-    if (req.body && Object.keys(req.body).length > 0)
+    res.on("finish", function()
     {
-      console.log(`[req-body] ${JSON.stringify(req.body)}`);
-    }
-
-    const origWrite = res.write.bind(res);
-    const origEnd = res.end.bind(res);
-    var responseChunks = [];
-
-    res.write = function(chunk)
-    {
-      if (chunk) { responseChunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk)); }
-      return origWrite(chunk);
-    };
-
-    res.end = function(chunk)
-    {
-      if (chunk) { responseChunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk)); }
       const elapsed = Date.now() - start;
       console.log(`[res] method=${method || "(none)"} session=${sessionId} status=${res.statusCode} ${elapsed}ms`);
+    });
 
-      if (responseChunks.length > 0)
-      {
-        const body = responseChunks.join("");
-        console.log(`[res-body] ${body.slice(0, 2000)}`);
-      }
-
-      return origEnd(chunk);
-    };
-
-    const server = createServer(html, { domain: process.env.DOMAIN, xmlReference, mermaidReference, shapeIndex });
+    const server = createServer(html, { domain: process.env.DOMAIN, xmlReference, mermaidReference, shapeIndex, iconServiceUrl, buildId });
 
     const transport = new StreamableHTTPServerTransport(
     {
@@ -215,7 +268,7 @@ async function startStreamableHTTPServer()
 
 async function startStdioServer()
 {
-  await createServer(html, { domain: process.env.DOMAIN, xmlReference, mermaidReference, shapeIndex }).connect(new StdioServerTransport());
+  await createServer(html, { domain: process.env.DOMAIN, xmlReference, mermaidReference, shapeIndex, iconServiceUrl, buildId }).connect(new StdioServerTransport());
 }
 
 async function main()

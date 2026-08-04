@@ -5,54 +5,81 @@ import {
 } from "@modelcontextprotocol/ext-apps/server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { normalizeDiagramXml, INVALID_DIAGRAM_XML_MESSAGE } from "./normalize-diagram-xml.js";
-import postprocessModule from "../../postprocessor/postprocess.js";
-var postprocessDiagramXml = postprocessModule.postprocess;
-
-// Cloudflare Workers don't give you wall-clock time at module-init —
-// new Date() at top-level returns epoch (1970). We lazy-initialize
-// the version string on first request (which has real wall-clock),
-// and cache it. Value will be close to "first request after the
-// worker cold-started" which is a few ms after deploy rollout.
-var _buildVersion = null;
-function getBuildVersion()
-{
-  if (_buildVersion == null)
-  {
-    _buildVersion = "drawio-mcp-" + new Date().toISOString();
-  }
-  return _buildVersion;
-}
+import { normalizeDiagramXml, absolutizeImageUrls, INVALID_DIAGRAM_XML_MESSAGE } from "./normalize-diagram-xml.js";
+import { buildTagMap } from "../../shared/shape-search.js";
+import { searchShapesAndIcons, DEFAULT_ICON_SERVICE_URL } from "../../shared/icon-search.js";
 
 /**
  * Build the self-contained HTML string that renders diagrams.
- * All dependencies (ext-apps App class, pako deflate, drawio-mermaid,
- * drawio-elk) are inlined so the HTML works in a sandboxed iframe with
- * no extra fetches.
+ * The MCP Apps App class and pako deflate are inlined. The draw.io viewer,
+ * drawio-elk, drawio-mermaid, and libavoid (pure-JS router bundle + routing
+ * core from js/libavoid-js/) load from the viewer.diagrams.net CDN
+ * by default — cached cross-session and kept in version-sync with each
+ * draw.io release. Pass viewerJs/elkJs/mermaidJs/libavoidJs to inline a
+ * local build instead (for dev — see VIEWER_PATH/ELK_PATH/MERMAID_PATH in
+ * index.js).
  *
  * @param {string} appWithDepsJs - The processed MCP Apps SDK bundle (exports stripped, App alias added).
  * @param {string} pakoDeflateJs - The pako deflate browser bundle.
- * @param {string} mermaidJs - The drawio-mermaid IIFE bundle. Exposes `mxMermaidToDrawio.parseText(text, config)`. Reads `globalThis.ELK` on init — caller must inline `elkJs` first.
+ * @param {string} [mermaidJs] - If provided, inlines this drawio-mermaid bundle instead of loading it from CDN. Exposes `mxMermaidToDrawio.parseText(text, config)`; reads `globalThis.ELK` on init (loaded before it either way).
  * @param {object} [options] - Optional configuration.
  * @param {string} [options.viewerJs] - If provided, inlines this JS instead of loading viewer-static.min.js from CDN.
- * @param {string} [options.elkJs] - The drawio-elk IIFE bundle. Defines `var ELK` consumed by drawio-mermaid and mxElkLayout. Inlined before mermaid.
- * @param {string} [options.mxElkLayoutJs] - The mxElkLayout wrapper. Requires ELK on globalThis (load order: elk → mermaid → mxElkLayout).
+ * @param {string} [options.elkJs] - If provided, inlines this drawio-elk bundle instead of loading it from CDN. Defines `var ELK` (engine) plus `ElkLayout`/`ElkAdapter`/`ElkApplier` (the mxGraph bridge + postLayout facade), consumed by drawio-mermaid and the postLayout pass. Loaded before mermaid.
+ * @param {string} [options.libavoidJs] - If provided, inlines this libavoid-js bundle (the drawio-dev js/libavoid-js/libavoid.min.js pure-JS build, used as-is — a self-contained classic script that publishes `globalThis.Avoid` and parks `window.__libavoidReady` synchronously) with libavoid-routing.js (defines `globalThis.AvoidRouting`) appended, instead of loading the libavoid block from the CDN. Powers the `routing: "libavoid"` edge-routing pass.
+ * @param {string[]} [options.libavoidUrls] - The two libavoid script URLs in load order (pure-JS router bundle, routing core), typically ETag-versioned (libavoid-versions.js) so a draw.io release busts the browser cache immediately. Defaults to the plain CDN URLs; ignored when libavoidJs inlines a local build.
+ * @param {string} [options.buildId] - Build identifier (git SHA + timestamp). Exposed as window.__DRAWIO_BUILD in the iframe.
  * @returns {string} Self-contained HTML string.
  */
 export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
 {
   var viewerJs = (options && options.viewerJs) || null;
   var elkJs = (options && options.elkJs) || null;
-  var mxElkLayoutJs = (options && options.mxElkLayoutJs) || null;
-  var buildVersion = (options && options.buildVersion) || ('drawio-mcp-' + new Date().toISOString());
+  var libavoidJs = (options && options.libavoidJs) || null;
+  var buildId = (options && options.buildId) || "unknown";
+
+  // libavoid-js (obstacle-avoiding orthogonal edge router). libavoid.min.js
+  // is the pure-JS Emscripten build from drawio-dev js/libavoid-js/ — a
+  // self-contained classic script (no WASM, no fetch) that publishes
+  // globalThis.Avoid and parks window.__libavoidReady (an already-resolved
+  // promise: the Avoid namespace, or null when init failed) synchronously on
+  // execution. The routing pass awaits __libavoidReady on demand; failures
+  // degrade gracefully — applyRouting just skips and the diagram renders
+  // unrouted.
+  //
+  // ETag-versioned URLs from the Node server (options.libavoidUrls, see
+  // libavoid-versions.js) bust the CDN's 30-day browser cache exactly when a
+  // draw.io release changes a file. The plain-URL default below applies only
+  // when the option is omitted — the Worker build (build-html.js) and tests;
+  // the Node server always passes the option (a failed version check
+  // surfaces as plain URLs from libavoid-versions.js, not from this array).
+  // Fixed order: pure-JS router bundle -> routing core.
+  var libavoidSrcs = (options && options.libavoidUrls) || [
+    'https://viewer.diagrams.net/js/libavoid-js/libavoid.min.js',
+    'https://viewer.diagrams.net/js/libavoid-js/libavoid-routing.js'
+  ];
+
+  var libavoidBlock = libavoidJs
+    ? '<!-- libavoid-js (inlined local build: pure-JS router bundle + routing core). Publishes\n' +
+      '         globalThis.Avoid and parks window.__libavoidReady synchronously. Powers the\n' +
+      '         routing:"libavoid" pass. -->\n' +
+      '    <script>' + libavoidJs + '</script>'
+    : '<!-- libavoid-js (pure-JS edge router bundle) + shared routing core from the viewer.diagrams.net\n' +
+      '         CDN, like drawio-elk/drawio-mermaid: cached cross-session, version-synced with each\n' +
+      '         draw.io release, and byte-identical to what the draw.io editor bundles. The bundle\n' +
+      '         publishes globalThis.Avoid and parks window.__libavoidReady synchronously — no WASM,\n' +
+      '         no fetch, so the sandbox CSP is satisfied by plain script-src. -->\n' +
+      libavoidSrcs.map(function(u)
+      {
+        return '    <script src="' + u + '"></script>';
+      }).join('\n');
+
   return `<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <base href="https://app.diagrams.net/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
     <title>draw.io Diagram</title>
-    <link rel="icon" href="/favicon.png" type="image/png" />
+    <link rel="icon" href="https://app.diagrams.net/favicon.png" type="image/png" />
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -170,17 +197,37 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
         height: 100% !important;
         overflow: hidden !important;
       }
-      /* Custom viewer mode: mouse-drag pans the diagram. Wheel + pinch
-         intentionally NOT handled — they bubble to the parent so the
-         chat page scrolls/zooms naturally over the diagram (touch-action
-         defaults to auto). user-select disabled so a pan-drag doesn't
-         leave a text-selection trail behind. */
+      /* Custom viewer mode: mouse-drag pans, wheel + ctrl-wheel zooms.
+         Touch: 1-finger pan in fullscreen, 2-finger pinch+pan in either
+         mode. touch-action: pan-y in inline lets a 1-finger swipe reach
+         the chat scroller while telling the browser it cannot claim
+         pinch for page zoom — without this, iOS WebKit intercepts the
+         second touchpoint mid-gesture and fires touchcancel on us.
+         user-select disabled so a pan-drag doesn't leave a text-
+         selection trail behind. */
       #diagram-container.custom-viewer {
         cursor: grab;
         user-select: none;
         -webkit-user-select: none;
+        touch-action: pan-y;
+      }
+      body.fullscreen #diagram-container.custom-viewer {
+        touch-action: none;
       }
       #diagram-container.custom-viewer.dragging { cursor: grabbing; }
+      /* When the user pans or zooms past the original SVG bbox, the
+         CSS transform paints content outside the SVG's intrinsic box
+         and outside the .mxgraph wrappers — the default overflow:hidden
+         on those wrappers (set above to suppress horizontal scrollbars
+         on oversized SVGs) clips the visible result and gives the
+         truncated cell labels visible on mobile pan. Same trick as
+         .morph-active: loosen overflow everywhere inside, but keep
+         #diagram-container itself clipping so spillover doesn't bleed
+         past the card edge. */
+      #diagram-container.custom-viewer * {
+        overflow: visible !important;
+        max-width: none !important;
+      }
       /* GraphViewer sets inline width on its wrappers based on the
          diagram's natural width, which can exceed the iframe width and
          create a horizontal scrollbar between the SVG and the toolbar.
@@ -290,7 +337,7 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
       }
     </style>
     <script>
-      window.__DRAWIO_BUILD = ${JSON.stringify(buildVersion)};
+      window.__DRAWIO_BUILD = ${JSON.stringify(buildId)};
     </script>
   </head>
   <body>
@@ -306,7 +353,7 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
         <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="6" x2="12" y2="18"/><line x1="6" y1="12" x2="18" y2="12"/></svg>
       </button>
       <button id="zoom-fit-btn" class="icon-only" style="display:none" title="Zoom in" aria-label="Zoom in">
-        <svg id="zoom-fit-icon-zoomin" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/><line x1="15.5" y1="15.5" x2="20" y2="20"/></svg>
+        <svg id="zoom-fit-icon-zoomin" viewBox="0 0 24 24" aria-hidden="true"><text x="12" y="17" text-anchor="middle" font-family="-apple-system,system-ui,Segoe UI,sans-serif" font-size="13" font-weight="700" fill="currentColor" stroke="none">1:1</text></svg>
         <svg id="zoom-fit-icon-fit" viewBox="0 0 24 24" aria-hidden="true" style="display:none"><polyline points="4 8 4 4 8 4"/><polyline points="16 4 20 4 20 8"/><polyline points="4 16 4 20 8 20"/><polyline points="16 20 20 20 20 16"/><rect x="8" y="9" width="8" height="6" rx="1"/></svg>
       </button>
       <button id="open-drawio" title="Open this diagram in draw.io to edit" aria-label="Open in draw.io">
@@ -318,22 +365,12 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
         <span id="copy-xml-label">Copy</span>
       </button>
       <button id="fullscreen-btn" class="icon-only" title="Toggle fullscreen" aria-label="Toggle fullscreen">
-        <svg id="fs-icon-enter" viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 8 4 4 8 4"/><polyline points="16 4 20 4 20 8"/><polyline points="20 16 20 20 16 20"/><polyline points="8 20 4 20 4 16"/></svg>
-        <svg id="fs-icon-exit" viewBox="0 0 24 24" aria-hidden="true" style="display:none"><polyline points="8 4 8 8 4 8"/><polyline points="16 4 16 8 20 8"/><polyline points="20 16 16 16 16 20"/><polyline points="4 16 8 16 8 20"/></svg>
+        <svg id="fs-icon-enter" viewBox="0 -960 960 960" aria-hidden="true"><path fill="currentColor" stroke="none" d="M120-120v-320h80v184l504-504H520v-80h320v320h-80v-184L256-200h184v80H120Z"/></svg>
+        <svg id="fs-icon-exit" viewBox="0 -960 960 960" aria-hidden="true" style="display:none"><path fill="currentColor" stroke="none" d="m136-80-56-56 264-264H160v-80h320v320h-80v-184L136-80Zm344-400v-320h80v184l264-264 56 56-264 264h184v80H480Z"/></svg>
       </button>
       <button id="expand-btn" class="icon-only" style="display:none" title="Expand vertically" aria-label="Expand vertically">
-        <svg id="expand-icon-expand" viewBox="0 0 24 24" aria-hidden="true">
-          <polyline points="8 7 12 3 16 7"/>
-          <line x1="12" y1="3" x2="12" y2="11"/>
-          <polyline points="8 17 12 21 16 17"/>
-          <line x1="12" y1="13" x2="12" y2="21"/>
-        </svg>
-        <svg id="expand-icon-collapse" viewBox="0 0 24 24" aria-hidden="true" style="display:none">
-          <polyline points="8 3 12 7 16 3"/>
-          <line x1="12" y1="7" x2="12" y2="11"/>
-          <polyline points="8 21 12 17 16 21"/>
-          <line x1="12" y1="13" x2="12" y2="17"/>
-        </svg>
+        <svg id="expand-icon-expand" viewBox="0 -960 960 960" aria-hidden="true"><path fill="currentColor" stroke="none" d="M440-520v-208l-64 64-56-56 160-160 160 160-56 56-64-62v206h-80ZM440-440v208l-64-64-56 56 160 160 160-160-56-56-64 62v-206h-80Z"/></svg>
+        <svg id="expand-icon-collapse" viewBox="0 -960 960 960" aria-hidden="true" style="display:none"><path fill="currentColor" stroke="none" d="M440-880v208l-64-64-56 56 160 160 160-160-56-56-64 62v-206h-80ZM440-80v-208l-64 64-56-56 160-160 160 160-56 56-64-62v206h-80Z"/></svg>
       </button>
       <button id="layout-btn" class="icon-only" style="display:none" title="Layout: as authored" aria-label="Cycle layout">
         <svg id="layout-icon-none" viewBox="0 0 24 24" aria-hidden="true">
@@ -372,10 +409,13 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
     <!-- pako deflate (inlined, for #create URL generation) -->
     <script>${pakoDeflateJs}</script>
 
+    <!-- drawio-elk. Defines var ELK + ElkLayout/ElkAdapter/ElkApplier (engine + mxGraph bridge), consumed by drawio-mermaid and the postLayout pass. Must come before drawio-mermaid. -->
     ${elkJs
-      ? '<!-- drawio-elk (inlined). Defines var ELK consumed by drawio-mermaid and mxElkLayout. Must come before drawio-mermaid. -->\n    <script>' + elkJs + '<\/script>'
-      : ''
+      ? '<script>' + elkJs + '<\/script>'
+      : '<script src="https://viewer.diagrams.net/js/elk/drawio-elk.min.js"><\/script>'
     }
+
+    ${libavoidBlock}
 
     <!-- drawio-mermaid (inlined). Exposes mxMermaidToDrawio.parseText(text, config).
          Loaded after the viewer so mermaidShapes.js can see mxCellRenderer/mxActor,
@@ -390,17 +430,16 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
         EditorUi.prototype.emptyDiagramXml = '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>';
       }
     </script>
-    <script>${mermaidJs}</script>
-
-    ${mxElkLayoutJs
-      ? '<!-- mxElkLayout wrapper: buildElkGraph, applyElkLayout, executeAsync. Depends on mxGraph (viewer) + ELK (from drawio-elk above). -->\n    <script>' + mxElkLayoutJs + '<\/script>'
-      : ''
+    ${mermaidJs
+      ? '<script>' + mermaidJs + '<\/script>'
+      : '<script src="https://viewer.diagrams.net/js/mermaid/drawio-mermaid.min.js"><\/script>'
     }
 
     <!-- MCP Apps SDK (inlined, exports stripped, App alias added) -->
     <script>
 ${appWithDepsJs}
 ${normalizeDiagramXml.toString()}
+${absolutizeImageUrls.toString()}
 
 // --- XML healing for partial/streaming XML ---
 
@@ -437,7 +476,7 @@ function healPartialXml(partialXml)
   // Strip XML comments to avoid confusing the tag scanner.
   // Comments may span multiple lines and contain '<' or '>'.
   // Also remove any incomplete comment at the end (opened but not closed).
-  var stripped = xml.replace(/<!--[\s\S]*?-->/g, '').replace(/<!--[\s\S]*$/, '');
+  var stripped = xml.replace(/<!--[\\s\\S]*?-->/g, '').replace(/<!--[\\s\\S]*$/, '');
 
   // Track open tags using a simple stack-based approach.
   // We scan for opening and closing tags, ignoring self-closing ones.
@@ -555,11 +594,11 @@ function isContainerVertex(cell)
   // Generic drawio container marker
   if (s.indexOf('container=1') >= 0) return true;
   // Bare shape token: "swimlane;..." or "...;group;..."
-  if (/(?:^|;)\s*(?:swimlane|group)\s*(?:;|$)/.test(s)) return true;
+  if (/(?:^|;)\\s*(?:swimlane|group)\\s*(?:;|$)/.test(s)) return true;
   // shape=anything-with-group / anything-with-swimlane: catches AWS
   // group shapes (mxgraph.aws4.group, mxgraph.aws4.groupCenter, …)
   // that don't carry container=1 explicitly.
-  if (/(?:^|;)\s*shape\s*=\s*[^;]*(?:group|swimlane)/i.test(s)) return true;
+  if (/(?:^|;)\\s*shape\\s*=\\s*[^;]*(?:group|swimlane)/i.test(s)) return true;
   return false;
 }
 
@@ -710,6 +749,38 @@ function healMermaidText(partialText)
 }
 
 /**
+ * Returns the first significant Mermaid line — the diagram-type
+ * directive (e.g. "flowchart TD") — with blank lines, %% comments, and
+ * any leading "--- ... ---" frontmatter block skipped. Returns null if
+ * no such line exists.
+ */
+function firstMermaidDirectiveLine(text)
+{
+  if (text == null || typeof text !== 'string') return null;
+  var lines = text.split(/\\r?\\n/);
+  var inFrontmatter = false;
+  var sawOpener = false;
+  for (var i = 0; i < lines.length; i++)
+  {
+    var line = lines[i].trim();
+    if (line === '' || line.indexOf('%%') === 0) continue;
+    if (inFrontmatter)
+    {
+      if (line === '---') inFrontmatter = false;
+      continue;
+    }
+    if (!sawOpener && line === '---')
+    {
+      inFrontmatter = true;
+      sawOpener = true;
+      continue;
+    }
+    return line;
+  }
+  return null;
+}
+
+/**
  * Returns true if the Mermaid text declares a flowchart (or its legacy
  * "graph" synonym). Used to surface the layout-cycle button on
  * flowcharts even when the LLM didn't request a postLayout — they're
@@ -717,16 +788,10 @@ function healMermaidText(partialText)
  */
 function isMermaidFlowchart(text)
 {
-  if (text == null || typeof text !== 'string') return false;
-  var lines = text.split(/\\r?\\n/);
-  for (var i = 0; i < lines.length; i++)
-  {
-    var line = lines[i].trim();
-    if (line === '' || line.indexOf('%%') === 0) continue;
-    var first = line.split(/\\s+/)[0];
-    return first === 'flowchart' || first === 'graph';
-  }
-  return false;
+  var line = firstMermaidDirectiveLine(text);
+  if (line == null) return false;
+  var first = line.split(/\\s+/)[0];
+  return first === 'flowchart' || first === 'graph';
 }
 
 /**
@@ -736,35 +801,36 @@ function isMermaidFlowchart(text)
  */
 function isMermaidHorizontalFlowchart(text)
 {
-  if (text == null || typeof text !== 'string') return false;
-  var lines = text.split(/\\r?\\n/);
-  for (var i = 0; i < lines.length; i++)
-  {
-    var line = lines[i].trim();
-    if (line === '' || line.indexOf('%%') === 0) continue;
-    var parts = line.split(/\\s+/);
-    var first = parts[0];
-    if (first !== 'flowchart' && first !== 'graph') return false;
-    var orient = (parts[1] || '').toUpperCase();
-    return orient === 'LR' || orient === 'RL';
-  }
-  return false;
+  var line = firstMermaidDirectiveLine(text);
+  if (line == null) return false;
+  var parts = line.split(/\\s+/);
+  var first = parts[0];
+  if (first !== 'flowchart' && first !== 'graph') return false;
+  var orient = (parts[1] || '').toUpperCase();
+  return orient === 'LR' || orient === 'RL';
 }
 
 /**
- * True when the Mermaid source begins with a "--- title: ... ---"
- * frontmatter block. ELK's horizontalFlow layout has no concept of a
- * title and stuffs it into the leftmost layer alongside the flow nodes,
- * crushing the diagram. Used to suppress a requested horizontalFlow
- * postLayout (verticalFlow puts the title in its own top row and is
- * fine, so it isn't blocked).
+ * Translates the public postLayout value (+ optional direction) into the
+ * internal layered-flow algorithm string. The only supported value is "elk"
+ * (ELK layered flow); its direction is, for Mermaid, taken from the flowchart
+ * code (TD/TB vs LR/RL) so the on-screen layout always matches what the
+ * round-trip ELK directive reproduces; for XML it comes from the optional
+ * direction field (default vertical, since XML carries no inherent direction).
+ * Returns null when postLayout is anything else (including unset).
+ *
+ * @param {string|null} postLayout  - "elk" (or null)
+ * @param {string|null} direction   - "vertical" | "horizontal" (XML only)
+ * @param {string|null} mermaidText - the Mermaid source, or null for XML
  */
-function mermaidHasTitleFrontmatter(text)
+function resolvePostLayout(postLayout, direction, mermaidText)
 {
-  if (text == null || typeof text !== 'string') return false;
-  var m = /^\\s*---\\s*\\r?\\n([\\s\\S]*?)\\r?\\n---\\s*(\\r?\\n|$)/.exec(text);
-  if (!m) return false;
-  return /^\\s*title\\s*:/m.test(m[1]);
+  if (postLayout !== 'elk') return null;
+
+  var horizontal = (mermaidText != null)
+    ? isMermaidHorizontalFlowchart(mermaidText)
+    : (direction === 'horizontal');
+  return horizontal ? 'horizontalFlow' : 'verticalFlow';
 }
 
 /**
@@ -959,6 +1025,10 @@ const copyXmlBtn     = document.getElementById("copy-xml-btn");
 const layoutBtn      = document.getElementById("layout-btn");
 var drawioEditUrl = null;
 var currentXml = null;
+// Mermaid source backing the current diagram (null for plain-XML diagrams).
+// Set whenever a Mermaid conversion runs; consumed by commitDiagramXml to
+// wrap the export XML so the source round-trips when reopened in the editor.
+var currentMermaidText = null;
 var invalidDiagramXmlMessage = ${JSON.stringify(INVALID_DIAGRAM_XML_MESSAGE)};
 
 // --- State ---
@@ -1146,6 +1216,64 @@ function waitForGraphViewer()
   });
 }
 
+// ─── Layout gate ─────────────────────────────────────────────────
+// The host may keep this iframe display:none while a tool result
+// streams in (or when revisiting an old message). Without layout every
+// DOM measurement reads 0x0, so a Mermaid parse done in that state
+// sizes all nodes to their shape minimum — and the conversion cache
+// would then serve that zero-sized parse as the final render. There is
+// also nothing to see while hidden (streaming animation included), so
+// all Mermaid parse/render work waits here until the document actually
+// has layout. drawio-mermaid additionally guards measureText against
+// degenerate 0x0 measurements as defense in depth.
+
+function isDocumentLaidOut()
+{
+  return document.documentElement != null &&
+    document.documentElement.clientWidth > 0;
+}
+
+var documentLaidOutPromise = null;
+
+function whenDocumentLaidOut()
+{
+  if (documentLaidOutPromise != null) return documentLaidOutPromise;
+
+  documentLaidOutPromise = new Promise(function(resolve)
+  {
+    if (isDocumentLaidOut()) { resolve(); return; }
+
+    var observer = null;
+    var timer = null;
+    var finish = function()
+    {
+      if (observer != null) { observer.disconnect(); observer = null; }
+      if (timer != null) { clearInterval(timer); timer = null; }
+      resolve();
+    };
+
+    // IntersectionObserver fires on visibility changes even while rAF
+    // is frozen in a hidden iframe; the interval is a fallback for
+    // embedders where the observer never fires.
+    try
+    {
+      observer = new IntersectionObserver(function()
+      {
+        if (isDocumentLaidOut()) finish();
+      });
+      observer.observe(document.documentElement);
+    }
+    catch (e) { /* fall back to polling below */ }
+
+    timer = setInterval(function()
+    {
+      if (isDocumentLaidOut()) finish();
+    }, 200);
+  });
+
+  return documentLaidOutPromise;
+}
+
 // Cache one (text, xml) pair so finalize doesn't re-parse the same
 // Mermaid text the streaming path already parsed. parseText is
 // expensive (50–300 ms for moderate diagrams) and the finalized text
@@ -1157,6 +1285,7 @@ function rememberMermaidConversion(text, xml)
 {
   lastConvertedMermaidText = text;
   lastConvertedMermaidXml = xml;
+  currentMermaidText = text;
 }
 
 function convertMermaidToXml(mermaidText)
@@ -1178,9 +1307,14 @@ function convertMermaidToXml(mermaidText)
     return Promise.reject(new Error("drawio-mermaid bundle not loaded"));
   }
 
-  var config = {
-    theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'default'
-  };
+  // Always render with the 'default' theme: its palette is expressed in
+  // light-dark() adaptive colors, so a single render is correct in BOTH light
+  // and dark hosts (the viewer/editor color-scheme selects the variant). The
+  // named 'dark' theme is mermaid's STATIC dark palette — forcing it on a dark
+  // host bakes in fixed dark colors that then render wrong if the same diagram
+  // is later opened or exported in light mode. light-dark() is the dark-mode
+  // support; don't override it based on the host's current color-scheme.
+  var config = { theme: 'default' };
 
   try
   {
@@ -1215,6 +1349,111 @@ function generateDrawioEditUrl(xml)
   return "https://app.diagrams.net/?pv=0&grid=0#create=" + encodeURIComponent(JSON.stringify(createObj));
 }
 
+// Injects the ELK layout selector into the round-tripped Mermaid source so a
+// re-edit in draw.io reproduces the layered ELK layout (drawio-dev's
+// isMermaidElkFlowchart() trigger fires and re-renders through its ElkLayout
+// post-pass instead of the dagre default).
+//
+// Since Mermaid v10.5.0 the %%{init}%% directive form is deprecated in favor of
+// the YAML-frontmatter config block, so we emit a "config: { layout: elk }".
+// drawio-mermaid maps config.layout === 'elk' to the same path the old
+// flowchart.defaultRenderer:elk directive triggered, and drawio-dev still
+// recognizes BOTH on re-edit (back-compat with already-saved diagrams).
+//
+// Placement rules: the config key must live INSIDE the frontmatter (Mermaid
+// only honors frontmatter at the very start of the document). So:
+//  - no frontmatter         -> emit a minimal "--- config: layout: elk ---" block
+//  - frontmatter, no config -> append a config block before the closing ---
+//  - frontmatter + config   -> nest "layout: elk" as the first child of config
+// An explicit renderer/layout already present (old directive, or any layout key
+// in the frontmatter) is respected and left untouched.
+function withElkRenderer(text)
+{
+  if (text == null) return text;
+  // Old %%{init ... defaultRenderer: "elk"}%% directive is still honored on
+  // re-edit; if present, leave the source untouched.
+  if (/defaultRenderer/i.test(text)) return text;
+
+  var fm = /^(---[ \\t]*\\r?\\n)([\\s\\S]*?)(---[ \\t]*\\r?\\n)/.exec(text);
+
+  // No frontmatter: emit a minimal block carrying just the ELK layout config.
+  if (fm == null)
+  {
+    return '---\\nconfig:\\n  layout: elk\\n---\\n' + text;
+  }
+
+  var open = fm[1], body = fm[2], close = fm[3];
+  var rest = text.substring(fm[0].length);
+
+  // Respect an explicit layout already declared in the frontmatter.
+  if (/(?:^|\\n)[ \\t]*layout[ \\t]*:/.test(body)) return text;
+
+  // Existing config: block -> nest "layout: elk" as its first child, matching
+  // the indentation of the block's existing children (falls back to one level
+  // deeper than config: when the block is empty).
+  var cfg = /(?:^|\\n)([ \\t]*)config[ \\t]*:[ \\t]*\\r?\\n/.exec(body);
+
+  if (cfg != null)
+  {
+    var at = cfg.index + cfg[0].length;
+    var child = /^([ \\t]+)\\S/.exec(body.substring(at));
+    var indent = child ? child[1] : (cfg[1] + '  ');
+    body = body.substring(0, at) + indent + 'layout: elk\\n' + body.substring(at);
+    return open + body + close + rest;
+  }
+
+  // Frontmatter present but no config: block -> append one before the closer.
+  return open + body + 'config:\\n  layout: elk\\n' + close + rest;
+}
+
+/**
+ * Sets the authoritative diagram XML behind "Open in draw.io" and the
+ * "Copy XML" button. Mermaid-derived diagrams are wrapped via the bundle's
+ * mxMermaidToDrawio.wrapGroup (same code path drawio-dev uses) so the source
+ * round-trips on reopen; plain-XML diagrams (currentMermaidText == null) are
+ * stored verbatim. The live streamGraph preview is intentionally left
+ * unwrapped so the ELK post-layout pass keeps operating on the flat cells.
+ *
+ * When the viewer is currently showing a layered ELK layout (currentLayoutState
+ * is 'vertical' / 'horizontal' — set by an explicit verticalFlow/horizontalFlow
+ * postLayout or the layout-toggle button), the stored Mermaid source gets the
+ * ELK layout config (frontmatter "config: { layout: elk }", via withElkRenderer)
+ * so a re-edit in draw.io re-runs through ELK — drawio-dev already applies its
+ * ElkLayout post-pass to elk-flowchart sources. Start/end pins are deliberately
+ * NOT carried in the config: Mermaid's ELK renderer accepts no such hints, and
+ * the baked geometry already round-trips on plain open/copy, so passing cell IDs
+ * in metadata would only add a fragile coupling for no layout gain.
+ */
+function commitDiagramXml(xml)
+{
+  var out = xml;
+
+  if (currentMermaidText != null &&
+      typeof mxMermaidToDrawio !== 'undefined' &&
+      typeof mxMermaidToDrawio.wrapGroup === 'function')
+  {
+    var elkLive = (currentLayoutState === 'vertical' ||
+                   currentLayoutState === 'horizontal');
+    var wrapText = elkLive ? withElkRenderer(currentMermaidText) : currentMermaidText;
+
+    try
+    {
+      // normalize: shift the wrapper's children so the padded
+      // transparentBounds group starts exactly at (0,0) — without it the
+      // padded bounds begin at (-groupPadding,-groupPadding) and draw.io
+      // extends the page above/left of the origin on "Open in draw.io".
+      out = mxMermaidToDrawio.wrapGroup(xml, wrapText, null, {normalize: true});
+    }
+    catch (e)
+    {
+      out = xml;
+    }
+  }
+
+  currentXml = out;
+  drawioEditUrl = generateDrawioEditUrl(out);
+}
+
 /**
  * Serialize the current graph model to draw.io XML. Used after a post-
  * layout pass so currentXml and drawioEditUrl reflect what the user
@@ -1235,167 +1474,27 @@ function serializeGraphXml(graph)
 }
 
 /**
- * Configure an mxElkLayout instance for the requested algorithm.
- * Returns null if the algorithm is unknown or the ELK bundle failed
- * to load. All options map to ELK's layered/mrtree/force/stress/radial
- * algorithms — direction only applies to 'layered'.
- */
-function createPostLayout(graph, algorithm)
-{
-  if (algorithm == null || algorithm === 'none') return null;
-  if (typeof mxElkLayout === 'undefined' || typeof ELK === 'undefined') return null;
-
-  // Algorithm presets mirror drawio-dev's ElkLayout.DEFAULTS so the
-  // viewer's layout output matches the editor's Arrange > Layout
-  // menu (Layered / Tree / Force / Stress / Radial).
-  // Ref: drawio-dev/src/main/webapp/js/diagramly/ElkLayout.js
-  var options = null;
-
-  switch (algorithm)
-  {
-    case 'verticalFlow':
-    case 'horizontalFlow':
-      options = {
-        'elk.algorithm': 'layered',
-        'elk.direction': algorithm === 'verticalFlow' ? 'DOWN' : 'RIGHT',
-        'elk.edgeRouting': 'ORTHOGONAL',
-        'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
-        'elk.spacing.nodeNode': '30',
-        'elk.layered.spacing.nodeNodeBetweenLayers': '30',
-        // Reserve space in the layer gap for edge labels so long labels
-        // don't overlap nodes on the next layer.
-        'elk.edgeLabels.inline': 'true',
-        'elk.spacing.edgeLabel': '5',
-        // Keep within-layer Y ordering aligned with child-declaration
-        // order in the model (what mermaid imports and hand-written
-        // XML both rely on).
-        'elk.layered.considerModelOrder.strategy': 'NODES',
-        'elk.layered.crossingMinimization.forceNodeModelOrder': 'true'
-      };
-      break;
-    case 'tree':
-      options = {
-        'elk.algorithm': 'mrtree',
-        'elk.direction': 'DOWN',
-        'elk.spacing.nodeNode': '20',
-        'elk.mrtree.weighting': 'MODEL_ORDER'
-      };
-      break;
-    case 'force':
-      options = {
-        'elk.algorithm': 'force',
-        // ELK's F-R model computes k = sqrt(area/(2n)) * nodeNode * 0.01,
-        // so nodeNode is a multiplier on natural edge length, not pixels.
-        // 10 matches the legacy mxFastOrganicLayout's fixed k≈50 — keeps
-        // the graph tight rather than blown out across the canvas.
-        'elk.spacing.nodeNode': '10',
-        'elk.force.iterations': '300',
-        'elk.force.repulsivePower': '0'
-      };
-      break;
-    case 'stress':
-      options = {
-        'elk.algorithm': 'stress',
-        'elk.spacing.nodeNode': '80',
-        'elk.stress.desiredEdgeLength': '100'
-      };
-      break;
-    case 'radial':
-      options = {
-        'elk.algorithm': 'radial',
-        'elk.spacing.nodeNode': '20'
-      };
-      break;
-    default:
-      return null;
-  }
-
-  var layout = new mxElkLayout(graph, options);
-  layout.algorithm = options['elk.algorithm'];
-  if (options['elk.direction'] != null) layout.direction = options['elk.direction'];
-  return layout;
-}
-
-/**
  * Apply a post-render layout to the given graph and animate the
  * vertices morphing from their original positions to the new ones.
  *
- * ELK runs async. We snapshot the current model into an ELK graph
- * synchronously, then when ELK returns we wrap applyElkLayout in a
- * beginUpdate block deferred by mxMorphing — mirroring the drawio
- * EditorUi.executeLayout pattern so the view stays on pre-layout
- * positions during the morph.
+ * ELK runs async via the drawio-elk ElkLayout facade: prepare() snapshots
+ * the model, runs ELK off the render path, and hands back a synchronous
+ * apply() closure (DEFAULTS merge + mermaid policy + isolated-node
+ * handling + edge style/corners + applier). We bracket apply() in a
+ * beginUpdate block deferred by mxMorphing — mirroring drawio's
+ * EditorUi.executeLayout so the view stays on pre-layout positions during
+ * the morph. The algorithm name + canonical edge treatment come from
+ * ElkLayout.MENU_PRESETS / ElkLayout.CANONICAL_EDGE in the bundle, the
+ * single source shared with the editor's menu and mermaid-edit post-pass.
  *
  * @param {Graph} graph
  * @param {string} algorithm - Enum value from the postLayout schema.
- * @param {object} [hints] - Optional layout hints.
- * @param {string[]} [hints.startNodeIds] - Cell IDs pinned to the first layer.
- * @param {string[]} [hints.endNodeIds]   - Cell IDs pinned to the last layer.
  * @param {function(boolean)} [onDone] - Called with true when the
  *   layout was applied, false when it was skipped or ELK errored.
  */
-/**
- * Force every edge in the graph to render as orthogonal-with-rounded-
- * corners: rounded=1 ON, curved=0 OFF. Called after layered ELK
- * layouts so that ORTHOGONAL bend points actually look like clean
- * right-angle routes (mermaid sets curved=1 by default, which would
- * spline through the bend points and produce wiggly edges).
- */
-function normalizeEdgesToRounded(graph)
+
+function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorph, fadeEdges)
 {
-  if (graph == null) return;
-  var model = graph.getModel();
-  var changed = 0;
-
-  for (var id in model.cells)
-  {
-    var cell = model.cells[id];
-    if (cell == null || !cell.edge) continue;
-
-    var style = cell.style || '';
-    var parts = style.split(';');
-    var seenRounded = false;
-    var out = [];
-
-    for (var i = 0; i < parts.length; i++)
-    {
-      var p = parts[i].trim();
-      if (p === '') continue;
-      if (p.indexOf('curved=') === 0) continue; // strip curved
-      if (p.indexOf('rounded=') === 0)
-      {
-        out.push('rounded=1');
-        seenRounded = true;
-      }
-      else
-      {
-        out.push(p);
-      }
-    }
-
-    if (!seenRounded) out.push('rounded=1');
-
-    var newStyle = out.join(';');
-    if (newStyle !== style)
-    {
-      model.setStyle(cell, newStyle);
-      changed++;
-    }
-  }
-
-}
-
-function applyPostLayout(graph, algorithm, hints, onDone, onMorphStart, awaitBeforeMorph)
-{
-  // Backwards-compatible arg shuffle: allow applyPostLayout(graph, alg, cb).
-  if (typeof hints === 'function')
-  {
-    onDone = hints;
-    hints = null;
-  }
-
-  hints = hints || {};
-
   var done = function(applied)
   {
     if (typeof onDone === 'function') onDone(applied);
@@ -1403,229 +1502,425 @@ function applyPostLayout(graph, algorithm, hints, onDone, onMorphStart, awaitBef
 
   if (graph == null) { done(false); return; }
 
-  var layout = createPostLayout(graph, algorithm);
-  if (layout == null) { done(false); return; }
+  if (typeof ElkLayout === 'undefined' || typeof ELK === 'undefined')
+  {
+    done(false);
+    return;
+  }
+
+  // Resolve the menu name (verticalFlow / horizontalFlow / …) to an ELK
+  // algorithm + the direction it pins. The per-algorithm option baseline,
+  // mermaid hierarchy policy, isolated-node handling, edge style and
+  // corners all live in the drawio-elk ElkLayout facade now — this used to
+  // be hand-rolled here via the mxElkLayout shim, which is gone.
+  var preset = (ElkLayout.MENU_PRESETS || {})[algorithm];
+  if (preset == null) { done(false); return; }
 
   var model = graph.getModel();
   var parent = graph.getDefaultParent();
 
-  var elkGraph;
-  try
+  // Nothing to lay out → bail (matches the old empty-elkGraph guard).
+  var hasVertex = false;
+  var childCount = model.getChildCount(parent);
+  for (var ci = 0; ci < childCount; ci++)
   {
-    elkGraph = layout.buildElkGraph(parent);
+    if (model.isVertex(model.getChildAt(parent, ci))) { hasVertex = true; break; }
   }
-  catch (e)
+  if (!hasVertex) { done(false); return; }
+
+  // Canonical edge treatment (strict orthogonalEdgeStyle connectors +
+  // rounded corners since drawio-elk f1af7db; the value ships with the CDN
+  // bundle), shared with the editor's mermaid-edit post-pass and Arrange >
+  // Layout dialog default. Safe to merge unconditionally here: this pass
+  // only ever runs the layered flow presets (see resolvePostLayout and the
+  // layout-cycle button), and the canonical MODE is layered-only by
+  // contract — the editor's resolveLayoutList guards non-layered presets.
+  // resizeParent:false pins the mermaid-measured node sizes — drawio-
+  // mermaid is the authority on sizing (its measureText falls back to a
+  // calibrated estimate when the iframe isn't rendered yet), and the
+  // bridge couples this flag to its vertex-label sizing so ELK lays out
+  // with the pinned sizes instead of reserving room for grown boxes it
+  // would never write back.
+  var elkOptions = { mermaidPolicy: true, applierOptions: { resizeParent: false } };
+  if (ElkLayout.CANONICAL_EDGE != null)
   {
-    done(false);
-    return;
-  }
-
-  if (!elkGraph.children || elkGraph.children.length === 0)
-  {
-    done(false);
-    return;
-  }
-
-  // For layered layouts (verticalFlow / horizontalFlow), pin Start/End
-  // nodes to the first/last layer. When the LLM gave explicit ID lists
-  // via startNodeIds / endNodeIds, use those verbatim — they reflect
-  // intent. Otherwise fall back to topological detection (sources =
-  // nodes with 0 incoming edges → FIRST, sinks = 0 outgoing → LAST),
-  // which handles well-formed acyclic flows but mispicks when a
-  // feedback edge (e.g. error → retry) makes a mid-graph node look
-  // like a source.
-  if (layout.algorithm === 'layered')
-  {
-    var firstIds = null;
-    var lastIds = null;
-
-    if (Array.isArray(hints.startNodeIds) && hints.startNodeIds.length > 0)
-    {
-      firstIds = {};
-      for (var i = 0; i < hints.startNodeIds.length; i++) firstIds[hints.startNodeIds[i]] = true;
-    }
-
-    if (Array.isArray(hints.endNodeIds) && hints.endNodeIds.length > 0)
-    {
-      lastIds = {};
-      for (var i = 0; i < hints.endNodeIds.length; i++) lastIds[hints.endNodeIds[i]] = true;
-    }
-
-    if (firstIds == null && lastIds == null)
-    {
-      // Fallback: topological source/sink detection.
-      var incomingCount = {};
-      var outgoingCount = {};
-
-      for (var i = 0; i < elkGraph.children.length; i++)
-      {
-        incomingCount[elkGraph.children[i].id] = 0;
-        outgoingCount[elkGraph.children[i].id] = 0;
-      }
-
-      if (elkGraph.edges != null)
-      {
-        for (var i = 0; i < elkGraph.edges.length; i++)
-        {
-          var edge = elkGraph.edges[i];
-
-          if (edge.sources != null)
-          {
-            for (var s = 0; s < edge.sources.length; s++)
-            {
-              if (outgoingCount[edge.sources[s]] != null) outgoingCount[edge.sources[s]]++;
-            }
-          }
-
-          if (edge.targets != null)
-          {
-            for (var t = 0; t < edge.targets.length; t++)
-            {
-              if (incomingCount[edge.targets[t]] != null) incomingCount[edge.targets[t]]++;
-            }
-          }
-        }
-      }
-
-      firstIds = {};
-      lastIds = {};
-
-      for (var i = 0; i < elkGraph.children.length; i++)
-      {
-        var nid = elkGraph.children[i].id;
-        if (incomingCount[nid] === 0 && outgoingCount[nid] > 0) firstIds[nid] = true;
-        else if (outgoingCount[nid] === 0 && incomingCount[nid] > 0) lastIds[nid] = true;
-      }
-    }
-
-    for (var i = 0; i < elkGraph.children.length; i++)
-    {
-      var node = elkGraph.children[i];
-
-      if (firstIds != null && firstIds[node.id])
-      {
-        if (node.layoutOptions == null) node.layoutOptions = {};
-        node.layoutOptions['elk.layered.layering.layerConstraint'] = 'FIRST';
-      }
-      else if (lastIds != null && lastIds[node.id])
-      {
-        if (node.layoutOptions == null) node.layoutOptions = {};
-        node.layoutOptions['elk.layered.layering.layerConstraint'] = 'LAST';
-      }
-    }
+    elkOptions.edgeStyleMode = ElkLayout.CANONICAL_EDGE.edgeStyleMode;
+    elkOptions.corners = ElkLayout.CANONICAL_EDGE.corners;
   }
 
-  // Run ELK and the pre-morph wait in parallel — the morph starts as
-  // soon as both have completed. ELK is the variable cost (100–500 ms
-  // for big diagrams); awaitBeforeMorph lets the caller hold the morph
-  // until pending pop-in animations settle, so mxMorphing snapshots a
-  // fully-opaque view. Without overlap, ELK and animation time would add.
-  Promise.all([new ELK().layout(elkGraph), awaitBeforeMorph || Promise.resolve()]).then(function(values)
+  var layout = new ElkLayout(graph, preset.algorithm,
+    Object.assign({}, preset.options), elkOptions);
+
+  // ELK gates layout application; awaitBeforeMorph gates mxMorphing
+  // separately. ELK is the variable cost (100–500 ms for big diagrams).
+  // The camera ease is decoupled from mxMorphing's snapshot, so it
+  // fires as soon as ELK has applied — no need to wait for pop-in
+  // animations to settle. mxMorphing still waits, because it snapshots
+  // cell opacity and would otherwise capture a half-faded view.
+  // prepare() runs ELK async and returns a synchronous apply() closure
+  // (DEFAULTS merge, mermaid policy, isolated-node extract/replace, edge
+  // style + corners, applier). We bracket apply() with beginUpdate so the
+  // mxMorphing animation below picks up the pre/post diff — the same shape
+  // the editor's ElkLayout.run + executeLayout uses.
+  layout.prepare(parent, function(err, apply)
   {
-    var result = values[0];
+    if (err != null) { done(false); return; }
+
     model.beginUpdate();
 
     var committed = false;
 
     try
     {
-      layout.applyElkLayout(result);
-      // For layered (verticalFlow / horizontalFlow) we asked ELK for
-      // ORTHOGONAL routing — the geometry is right-angle paths with
-      // bend points. Mermaid emits edges with curved=1 by default,
-      // which makes mxGraph spline through those bend points and
-      // produces wiggly curves. Force rounded=1 / curved=0 so the
-      // edges render as right-angles with rounded corners — the
-      // intent of the orthogonal routing.
-      if (layout.algorithm === 'layered')
-      {
-        normalizeEdgesToRounded(graph);
-      }
+      apply();
       committed = true;
     }
     catch (e)
     {
-      // ELK application failed; model.endUpdate() in finally will
-      // unwind the partial changes cleanly.
+      // ELK application failed.
     }
-    finally
-    {
-      if (committed)
-      {
-        // Commit with morph animation — morph captures the current
-        // view state (pre-ELK positions) and animates to the new
-        // model state, calling endUpdate on DONE.
-        //
-        // Don't call graph.fit() here: graph.fit mutates view.scale
-        // and view.translate, which would compose with our CSS
-        // viewTransform and double-scale the diagram. The caller
-        // re-runs streamFollowNewCells(graph) after done(true) to
-        // ease the CSS transform to the new fit. sizeDidChange is
-        // still needed so the SVG dims track the new bbox.
-        var refit = function()
-        {
-          try { graph.sizeDidChange(); } catch (_) {}
-        };
 
-        try
-        {
-          // 12 steps × ~30 ms ≈ 360 ms of cell morphing. Long enough
-          // to feel like a real layout transition, short enough to
-          // not drag. We pair this with a parallel camera animation
-          // (started via onMorphStart) for a single combined
-          // "diagram settles into its layout" beat.
-          var morph = new mxMorphing(graph, 12, 1.5, 30);
-          morph.addListener(mxEvent.DONE, function()
-          {
-            model.endUpdate();
-            refit();
-            // After endUpdate the view re-renders edges with their new
-            // waypoints/styles. Hide them synchronously so a paint
-            // can't sneak in showing stale-looking edges, then pen-draw
-            // them in the next frame using the streaming schedule.
-            hideAllEdgesForMorph(graph);
-            requestAnimationFrame(function()
-            {
-              penDrawAllEdgesAfterMorph(graph);
-            });
-            notifySize('postLayout');
-            try { containerEl.classList.remove('morph-active'); } catch (_) {}
-            done(true);
-          });
-          // Fire onMorphStart RIGHT BEFORE startAnimation: positions
-          // are already committed to the model (caller can compute
-          // fit-whole), but the visual morph hasn't begun yet, so a
-          // camera animation kicked off here lands in sync.
-          if (typeof onMorphStart === 'function')
-          {
-            try { onMorphStart(); } catch (_) {}
-          }
-          // Hide edges before morph starts so vertex animation isn't
-          // visually polluted by misaligned waypoints during the move.
-          hideAllEdgesForMorph(graph);
-          // Relax overflow on the SVG + mxgraph wrappers so cells
-          // passing through positions outside the OLD bbox aren't
-          // clipped before sizeDidChange/camera fit catches up.
-          try { containerEl.classList.add('morph-active'); } catch (_) {}
-          morph.startAnimation();
-        }
-        catch (e)
+    if (!committed)
+    {
+      model.endUpdate();
+      done(false);
+      return;
+    }
+
+    // Commit with morph animation — morph captures the current
+    // view state (pre-ELK positions) and animates to the new
+    // model state, calling endUpdate on DONE.
+    //
+    // Don't call graph.fit() here: graph.fit mutates view.scale
+    // and view.translate, which would compose with our CSS
+    // viewTransform and double-scale the diagram. The caller
+    // re-runs streamFollowNewCells(graph) after done(true) to
+    // ease the CSS transform to the new fit. sizeDidChange is
+    // still needed so the SVG dims track the new bbox.
+    var refit = function()
+    {
+      try { graph.sizeDidChange(); } catch (_) {}
+    };
+
+    // Camera ease fires NOW — model has new positions so the caller's
+    // computeFitWholeTransform sees the post-ELK bbox. The camera path
+    // doesn't depend on cell opacity, so we don't have to wait for
+    // pop-in to finish. The cell morph will follow whenever the
+    // animations-settled gate resolves.
+    if (typeof onMorphStart === 'function')
+    {
+      try { onMorphStart(); } catch (_) {}
+    }
+
+    (awaitBeforeMorph || Promise.resolve()).then(function()
+    {
+      try
+      {
+        // 12 steps × ~30 ms ≈ 360 ms of cell morphing. Long enough
+        // to feel like a real layout transition, short enough to
+        // not drag.
+        var morph = new mxMorphing(graph, 12, 1.5, 30);
+        morph.addListener(mxEvent.DONE, function()
         {
           model.endUpdate();
           refit();
+          // After endUpdate the view re-renders edges with their new
+          // waypoints/styles. Hide them synchronously so a paint
+          // can't sneak in showing stale-looking edges, then animate
+          // them back in. The first post-stream layout pairs with
+          // vertex pop-in so we pen-draw along the BFS schedule;
+          // subsequent layout-button toggles fade everything in
+          // together — the topological wipe is too slow on a model
+          // whose vertices are just morphing positions.
+          hideAllEdgesForMorph(graph);
+          requestAnimationFrame(function()
+          {
+            if (fadeEdges) fadeInAllEdgesAfterMorph(graph);
+            else penDrawAllEdgesAfterMorph(graph);
+          });
           notifySize('postLayout');
+          try { containerEl.classList.remove('morph-active'); } catch (_) {}
           done(true);
-        }
+        });
+        // Hide edges immediately before startAnimation so vertex
+        // animation isn't visually polluted by misaligned waypoints
+        // during the move. Deferred until now (rather than at ELK-done)
+        // so streaming pen-draws aren't cut short while we wait for
+        // awaitBeforeMorph to settle.
+        hideAllEdgesForMorph(graph);
+        // Relax overflow on the SVG + mxgraph wrappers so cells
+        // passing through positions outside the OLD bbox aren't
+        // clipped before sizeDidChange/camera fit catches up.
+        try { containerEl.classList.add('morph-active'); } catch (_) {}
+        morph.startAnimation();
       }
-      else
+      catch (e)
       {
         model.endUpdate();
-        done(false);
+        refit();
+        notifySize('postLayout');
+        done(true);
+      }
+    });
+  });
+}
+
+/**
+ * Absolute model-coordinate offset of a cell's parent chain. Edge waypoints
+ * and vertex geometries are stored relative to their parent; for flat diagrams
+ * (parent = the default layer) this is {0,0}, but a cell nested in a container
+ * needs its ancestors' positions summed. Stops at the layer (non-vertex).
+ */
+function getAbsoluteParentOffset(graph, cell)
+{
+  var model = graph.getModel();
+  var x = 0, y = 0;
+  var p = model.getParent(cell);
+  while (p != null && model.isVertex(p))
+  {
+    var pg = model.getGeometry(p);
+    if (pg != null) { x += pg.x; y += pg.y; }
+    p = model.getParent(p);
+  }
+  return { x: x, y: y };
+}
+
+/**
+ * A vertex's bounds in absolute model coordinates (geometry + parent offset).
+ */
+function getAbsoluteModelBounds(graph, cell)
+{
+  var geo = graph.getModel().getGeometry(cell);
+  if (geo == null) return null;
+  var off = getAbsoluteParentOffset(graph, cell);
+  return { x: geo.x + off.x, y: geo.y + off.y, w: geo.width, h: geo.height };
+}
+
+/**
+ * A fixed connection point on one end of an edge (exitX/exitY for the source,
+ * entryX/entryY for the target) as {x, y, dir} via
+ * AvoidRouting.constraintForPoint (from the vendored libavoid-routing.js —
+ * clamps to the pin's [0,1] domain, derives the ConnDirFlags from the
+ * original values). null for a floating endpoint. Mirrors
+ * LibavoidRouting.fixedConstraint in the draw.io editor.
+ */
+function libavoidFixedConstraint(style, source)
+{
+  return AvoidRouting.constraintForPoint(
+    parseFloat(mxUtils.getValue(style, source ? 'exitX' : 'entryX', null)),
+    parseFloat(mxUtils.getValue(style, source ? 'exitY' : 'entryY', null)));
+}
+
+/**
+ * Resolved jetty size (minimum first/last segment length, px) for one end of
+ * an edge, mirroring mxEdgeStyle.getJettySize: sourceJettySize/targetJettySize
+ * over jettySize, with 'auto' derived from the end's arrow size. A missing
+ * jettySize resolves as 'auto' — that's what the write-back sets, so the route
+ * matches a later in-editor re-route.
+ */
+function libavoidJettyFor(style, source)
+{
+  var value = mxUtils.getValue(style, source ? 'sourceJettySize' : 'targetJettySize',
+    mxUtils.getValue(style, 'jettySize', 'auto'));
+
+  if (value == 'auto')
+  {
+    var type = mxUtils.getValue(style, source ? 'startArrow' : 'endArrow', 'none');
+
+    if (type != 'none')
+    {
+      var size = mxUtils.getNumber(style, source ? 'startSize' : 'endSize', 6);
+      value = Math.max(2, Math.ceil((size + 10) / 10)) * 10; // orthBuffer 10
+    }
+    else
+    {
+      value = 20; // 2 * orthBuffer
+    }
+  }
+
+  value = parseFloat(value);
+  return isNaN(value) ? 0 : value;
+}
+
+/**
+ * Run libavoid over the current graph: register every vertex as an obstacle,
+ * route every edge (whose endpoints are known vertices) around them with
+ * orthogonal obstacle-avoiding paths, and write the resulting bend points
+ * back as edge waypoints. Vertices are NOT moved — this is pure edge routing,
+ * the complement to applyPostLayout (which moves vertices). Synchronous once
+ * Avoid is ready; the caller awaits readiness via applyRouting().
+ *
+ * The libavoid-driving core is AvoidRouting.computeRoutes from the vendored
+ * libavoid-routing.js (canonical source: drawio-dev js/libavoid-js/ — the same
+ * artifact the draw.io editor and the mcp-tool-server run), inlined with the
+ * libavoid glue. Here we only do the mxGraph-specific extract (vertices/edges
+ * in absolute coords) and write-back — incl. fixed connection points (directed
+ * pins) and per-end jetty stubs, like the editor's routeCells.
+ */
+function routeWithLibavoid(graph, Avoid)
+{
+  var model = graph.getModel();
+  var id;
+
+  // Extract obstacles + edges in absolute model coordinates.
+  var vertices = [];
+  var edges = [];
+  var edgeCells = {};
+
+  for (id in model.cells)
+  {
+    var c = model.cells[id];
+    if (c == null) continue;
+
+    if (c.vertex)
+    {
+      var b = getAbsoluteModelBounds(graph, c);
+      if (b != null && b.w > 0 && b.h > 0)
+      {
+        vertices.push({ id: id, x: b.x, y: b.y, w: b.w, h: b.h });
       }
     }
-  }).catch(function(e)
+    else if (c.edge)
+    {
+      var s = model.getTerminal(c, true);
+      var t = model.getTerminal(c, false);
+      if (s != null && t != null && s.vertex && t.vertex)
+      {
+        // Fixed connection points (exitX/entryX…) route via directed pins and
+        // the per-end jettySize gives their minimum stub — like the editor.
+        var st = graph.getCellStyle(c);
+        edges.push({ id: id, source: s.id, target: t.id,
+          sourceConstraint: libavoidFixedConstraint(st, true),
+          targetConstraint: libavoidFixedConstraint(st, false),
+          sourceJetty: libavoidJettyFor(st, true),
+          targetJetty: libavoidJettyFor(st, false) });
+        edgeCells[id] = c;
+      }
+    }
+  }
+
+  var routes = AvoidRouting.computeRoutes(Avoid, vertices, edges);
+  var routedIds = Object.keys(routes);
+  if (routedIds.length === 0) return false;
+
+  // Write the routes back. We keep orthogonalEdgeStyle (libavoid is already
+  // orthogonal) so the segments stay draggable in the draw.io editor, and tag
+  // each edge with libavoidRouting=1 (plus the editor's paired rounded/
+  // orthogonalLoop/jettySize defaults) so that if the diagram is opened in the
+  // full editor and a shape is later moved, the edge re-routes live via libavoid
+  // instead of reverting to the basic router. The flag is inert in this inline
+  // viewer (no libavoid extension) — the baked waypoints render as-is, so there
+  // is no shift on open. We leave the endpoints FLOATING — every route meets a
+  // shape at a side midpoint, which is where a floating orthogonal endpoint
+  // connects anyway. The helper's waypoints are absolute; convert to the edge's
+  // parent frame.
+  model.beginUpdate();
+  try
+  {
+    for (var i = 0; i < routedIds.length; i++)
+    {
+      var edge = edgeCells[routedIds[i]];
+      var wpsAbs = routes[routedIds[i]];
+      var off = getAbsoluteParentOffset(graph, edge);
+
+      var wps = [];
+      for (var k = 0; k < wpsAbs.length; k++)
+      {
+        wps.push(new mxPoint(wpsAbs[k].x - off.x, wpsAbs[k].y - off.y));
+      }
+
+      var geo = model.getGeometry(edge);
+      geo = (geo != null) ? geo.clone() : new mxGeometry();
+      geo.points = wps;
+      model.setGeometry(edge, geo);
+
+      var style = model.getStyle(edge) || '';
+      style = mxUtils.setStyle(style, mxConstants.STYLE_EDGE, 'orthogonalEdgeStyle');
+      style = mxUtils.setStyle(style, 'rounded', '0');
+      style = mxUtils.setStyle(style, 'curved', null);
+      style = mxUtils.setStyle(style, 'libavoidRouting', '1');
+      style = mxUtils.setStyle(style, 'orthogonalLoop', '1');
+      // Preserve an explicit jettySize (the route was computed with it — see
+      // libavoidJettyFor); only a missing one gets the editor default 'auto'.
+      if (!(/(^|;)jettySize=/.test(style)))
+      {
+        style = mxUtils.setStyle(style, 'jettySize', 'auto');
+      }
+      style = mxUtils.setStyle(style, 'html', '1');
+      model.setStyle(edge, style);
+    }
+  }
+  finally
+  {
+    model.endUpdate();
+  }
+
+  graph.view.validate();
+  console.log('[libavoid] routed ' + routedIds.length + ' edge(s)');
+  return true;
+}
+
+/**
+ * Async wrapper around routeWithLibavoid: await router readiness, then route.
+ * Degrades gracefully — calls onDone(false) (diagram stays unrouted) when
+ * libavoid isn't present, failed to load, or routing throws.
+ *
+ * @param {Graph} graph
+ * @param {function(boolean)} [onDone] - true when routes were applied.
+ */
+function applyRouting(graph, onDone)
+{
+  var done = function(applied)
+  {
+    if (typeof onDone === 'function') onDone(applied);
+  };
+
+  if (graph == null || typeof window === 'undefined' || window.__libavoidReady == null)
   {
     done(false);
+    return;
+  }
+
+  window.__libavoidReady.then(function(Avoid)
+  {
+    if (Avoid == null) { done(false); return; }
+    try { done(routeWithLibavoid(graph, Avoid)); }
+    catch (e) { console.error('[libavoid] routing failed:', (e && e.message), e); done(false); }
+  }).catch(function() { done(false); });
+}
+
+/**
+ * Run the libavoid routing pass and, when it applies, re-reveal the edges
+ * with a fade (the re-route changes every edge's waypoints) and persist the
+ * routed XML. routeWithLibavoid renders the new edges synchronously inside
+ * the same microtask, so hiding them here happens before the next paint —
+ * no flash of the un-faded routes. Vertices never move, so there is no
+ * camera change. onComplete(applied) fires after the pass either way.
+ */
+function runRoutingPass(graph, onComplete)
+{
+  applyRouting(graph, function(applied)
+  {
+    if (applied)
+    {
+      hideAllEdgesForMorph(graph);
+      requestAnimationFrame(function()
+      {
+        fadeInAllEdgesAfterMorph(graph);
+      });
+
+      try
+      {
+        var nx = serializeGraphXml(graph);
+        if (nx != null) commitDiagramXml(nx);
+      }
+      catch (_) {}
+
+      try { graph.sizeDidChange(); } catch (_) {}
+      notifySize('routing');
+    }
+
+    if (typeof onComplete === 'function') onComplete(applied);
   });
 }
 
@@ -1735,6 +2030,24 @@ function streamMergeXmlDelta(graph, pendingEdges, xmlNode)
 
       if (existing != null)
       {
+        // Promote a cell that was first inserted as a plain (non-vertex,
+        // non-edge) cell once its real role finally streams in. This
+        // happens with <object>/<UserObject> wrappers: the id lives on
+        // the wrapper but vertex/edge="1" lives on the inner <mxCell>.
+        // healPartialXml can close the wrapper before that inner cell
+        // arrives, so decodeCell yields an id-only cell with vertex=false.
+        // setStyle/setGeometry below would then update a cell the renderer
+        // never builds a shape for — it renders as blank space. Flip the
+        // flags and invalidate so the view rebuilds it as a real shape.
+        if ((decoded.vertex && !existing.vertex) ||
+            (decoded.edge && !existing.edge))
+        {
+          existing.vertex = decoded.vertex;
+          existing.edge = decoded.edge;
+          graph.view.clear(existing, false, false);
+          graph.view.invalidate(existing, true, false);
+        }
+
         if (decoded.style != null && decoded.style !== existing.style)
         {
           model.setStyle(existing, decoded.style);
@@ -2107,6 +2420,7 @@ function removeOrphanCells(graph, keepIds)
   for (var r = 0; r < removedIds.length; r++)
   {
     delete animatedCellIds[removedIds[r]];
+    delete popInEndsAt[removedIds[r]];
     var pi = pendingAnimCellIds.indexOf(removedIds[r]);
     if (pi >= 0) pendingAnimCellIds.splice(pi, 1);
     var di = deferredAnimCellIds.indexOf(removedIds[r]);
@@ -2126,6 +2440,13 @@ var animBatchStartT = 0;
 var deferredAnimCellIds = [];
 var deferredAnimTimer = null;
 var animatedCellIds = {};
+// Per-cell timestamp when the in-flight pop-in animation (opacity +
+// transform on the shape node) will be settled. Used by applyMorphAnimations
+// to skip CSS-translate morphs on cells whose pop-in hasn't finished —
+// otherwise morphNodeBy overwrites the style.transition that drives the
+// pop-in, causing the cell to snap to its final pop-in state before
+// starting to slide.
+var popInEndsAt = {};
 // Absolute timestamp when the most-recently-flushed batch's pop-in
 // animations are fully settled (opacity has reached 1 on every cell).
 // waitForPendingAnimationsToSettle uses this to gate mxMorphing so it
@@ -2306,6 +2627,11 @@ function flushCellAnimations(graph)
     var vs = graph.view.getState(vCell);
     if (vs == null) continue;
     var delaySec = (schedule.vertexDelay[vCell.id] || 0) / 1000;
+
+    // 400 ms = pop-in transition duration in popInVertexNode. Cells whose
+    // geometry shifts inside this window get their morph deferred until
+    // after pop-in settles (see applyMorphAnimations).
+    popInEndsAt[vCell.id] = nowFlush + (delaySec * 1000) + 400;
 
     if (vs.shape != null && vs.shape.node != null)
     {
@@ -2641,6 +2967,8 @@ function applyMorphAnimations(graph)
 
   var model = graph.getModel();
   var morphedIdSet = {};
+  var nowMorph = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
 
   for (var i = 0; i < ids.length; i++)
   {
@@ -2657,6 +2985,14 @@ function applyMorphAnimations(graph)
     var dy = pre.y - state.y;
 
     if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+
+    // Skip morph if the cell's pop-in transition hasn't settled yet —
+    // morphNodeBy would overwrite style.transition and snap opacity /
+    // transform to their final pop-in values, producing a visible flicker.
+    // The cell stays at its new model position (slight teleport) which is
+    // imperceptible during a fade-in. Edges connected to it are routed to
+    // the new endpoint already, so we don't queue a pen-redraw either.
+    if (popInEndsAt[id] != null && popInEndsAt[id] > nowMorph) continue;
 
     morphedIdSet[id] = true;
 
@@ -2691,16 +3027,30 @@ function morphNodeBy(node, dx, dy)
   // where the cell is currently visible.
   var current = parseTranslate(node);
 
-  // Cancel any in-flight transition before we set the new start value,
-  // otherwise the assignment itself would animate.
-  node.style.transition = 'none';
+  // Compose with any existing transition (e.g. an in-flight pop-in
+  // animating opacity / transform) instead of overwriting — overwriting
+  // would kill the other transitions and snap them to their final inline
+  // values, producing a visible flicker. We drop only the prior
+  // 'translate' entry so our new translate transition replaces it cleanly.
+  var prior = (node.style.transition || '')
+    .split(',')
+    .map(function(s) { return s.trim(); })
+    .filter(function(s)
+    {
+      return s.length > 0 && s.indexOf('translate') !== 0;
+    });
+
+  // Cancel any in-flight translate transition before we set the new
+  // start value, otherwise the assignment itself would animate.
+  node.style.transition = (prior.length > 0 ? prior.join(', ') + ', ' : '') + 'translate 0s';
   node.style.translate = (dx + current.x) + 'px ' + (dy + current.y) + 'px';
 
   // Force layout flush so the start state is captured before we
   // re-enable transitions.
   node.getBoundingClientRect();
 
-  node.style.transition = 'translate ' + MORPH_DURATION_MS + 'ms ease-out';
+  var newTranslate = 'translate ' + MORPH_DURATION_MS + 'ms ease-out';
+  node.style.transition = (prior.length > 0 ? prior.join(', ') + ', ' : '') + newTranslate;
 
   // Per-node token: a stale setTimeout from a prior morph must not
   // clear transition/translate while a fresh morph is mid-flight.
@@ -2731,7 +3081,7 @@ function parseTranslate(node)
   if (raw == null || raw === '' || raw === 'none') return { x: 0, y: 0 };
 
   // Computed value format: "Xpx", "Xpx Ypx", or "Xpx Ypx Zpx".
-  var parts = raw.split(/\s+/);
+  var parts = raw.split(/\\s+/);
   var x = parseFloat(parts[0]);
   var y = (parts.length > 1) ? parseFloat(parts[1]) : 0;
 
@@ -2743,10 +3093,13 @@ function parseTranslate(node)
 
 /**
  * For every edge whose source or target was morphed, hide the edge
- * group immediately and pen-draw it after the morph settles. Without
- * this the edge path is laid out from the NEW model terminal
- * positions while the vertex visually sits at its OLD position,
- * leaving a brief gap or dangling segment.
+ * group immediately and fade it back in after the morph settles.
+ * Without hiding, the edge path is laid out from the NEW model terminal
+ * positions while the vertex visually sits at its OLD position, leaving
+ * a brief gap or dangling segment. A full pen-draw was the original
+ * recovery, but Mermaid re-layouts shift many cells per partial and
+ * the repeated stroke-dashoffset wipes read as noisy; a quick opacity
+ * fade hides the disconnect just as well.
  */
 function hideAndRedrawEdgesForMorph(graph, morphedIdSet)
 {
@@ -2802,7 +3155,7 @@ function hideAndRedrawEdgesForMorph(graph, morphedIdSet)
 
   if (pendingShape.length === 0 && pendingText.length === 0) return;
 
-  // Pen-draw after the vertex morph has settled — the edge geometry
+  // Fade back in after the vertex morph has settled — the edge geometry
   // is already correct (laid out from the new terminal positions);
   // we just need it offscreen until the vertex visuals catch up.
   setTimeout(function()
@@ -2811,13 +3164,13 @@ function hideAndRedrawEdgesForMorph(graph, morphedIdSet)
     {
       var es = pendingShape[i];
       if (es.node.__edgeRedrawToken !== es.token) continue;
-      drawInEdgeNode(es.node, 0);
+      fadeInWithDelay(es.node, 0);
     }
     for (var j = 0; j < pendingText.length; j++)
     {
       var et = pendingText[j];
       if (et.node.__edgeRedrawToken !== et.token) continue;
-      fadeInWithDelay(et.node, 0.2);
+      fadeInWithDelay(et.node, 0);
     }
   }, MORPH_DURATION_MS);
 }
@@ -2886,6 +3239,33 @@ function penDrawAllEdgesAfterMorph(graph)
     if (es.text != null && es.text.node != null)
     {
       fadeInWithDelay(es.text.node, eDelaySec + 0.4);
+    }
+  }
+}
+
+/**
+ * Simple fade-in for every edge. Used after the layout-button morph
+ * where the topological pen-draw "wipe" feels too slow — we just want
+ * the edges to reappear quickly once the vertices have settled.
+ */
+function fadeInAllEdgesAfterMorph(graph)
+{
+  if (graph == null) return;
+  graph.view.validate();
+  var model = graph.getModel();
+  for (var id in model.cells)
+  {
+    var cell = model.cells[id];
+    if (cell == null || !cell.edge) continue;
+    var state = graph.view.getState(cell);
+    if (state == null) continue;
+    if (state.shape != null && state.shape.node != null)
+    {
+      fadeInWithDelay(state.shape.node, 0);
+    }
+    if (state.text != null && state.text.node != null)
+    {
+      fadeInWithDelay(state.text.node, 0);
     }
   }
 }
@@ -3751,6 +4131,7 @@ function endStreaming()
   pendingAnimCellIds = [];
   deferredAnimCellIds = [];
   animatedCellIds = {};
+  popInEndsAt = {};
   lastAnimEndT = 0;
 
   if (deferredAnimTimer != null)
@@ -3776,9 +4157,9 @@ function endStreaming()
   lastMergedMermaidText = null;
   lastConvertedMermaidText = null;
   lastConvertedMermaidXml = null;
+  currentMermaidText = null;
   originalCellGeometries = null;
   originalCellStyles = null;
-  lastLayoutHints = null;
   currentLayoutState = 'none';
   if (layoutBtn != null) layoutBtn.style.display = 'none';
   dblclickZoomedIn = false;
@@ -3827,8 +4208,9 @@ var lastFinalizedKey = null;
 function finalizeStreamingView(xml, opts)
 {
   opts = opts || {};
+  xml = absolutizeImageUrls(xml);
 
-  var key = (xml || '') + '|' + (opts.postLayout || '') + '|' + (opts.replaceMode ? 'r' : '');
+  var key = (xml || '') + '|' + (opts.postLayout || '') + '|' + (opts.routing || '') + '|' + (opts.replaceMode ? 'r' : '');
   if (key === lastFinalizedKey)
   {
     return;
@@ -3872,8 +4254,7 @@ function finalizeStreamingView(xml, opts)
     return;
   }
 
-  currentXml = xml;
-  drawioEditUrl = generateDrawioEditUrl(xml);
+  commitDiagramXml(xml);
 
   // Reveal the toolbar BEFORE the final fit. The toolbar adds ~50 px
   // to the body, which the host then reflects back as a smaller
@@ -3900,10 +4281,6 @@ function finalizeStreamingView(xml, opts)
   if (showLayoutBtn)
   {
     captureOriginalCellGeometries(streamGraph);
-    lastLayoutHints = {
-      startNodeIds: opts.startNodeIds || null,
-      endNodeIds: opts.endNodeIds || null
-    };
     var isHorizontal = (opts.postLayout === 'horizontalFlow') || opts.isHorizontal === true;
     layoutAlternativeState = isHorizontal ? 'horizontal' : 'vertical';
     if (opts.postLayout === 'verticalFlow') currentLayoutState = 'vertical';
@@ -3961,20 +4338,18 @@ function finalizeStreamingView(xml, opts)
 
   // Post-layout: morph cells from current positions to ELK output.
   // Kick off ELK immediately and let it run in parallel with the tail
-  // of the pop-in animations. applyPostLayout holds the morph until
-  // both have completed, so mxMorphing snapshots a fully-opaque view
-  // without imposing a fixed delay (which under-shot deep diagrams and
-  // over-shot shallow ones). The camera animation is started via
-  // onMorphStart so it runs in parallel with the morph, landing on
-  // fit-whole-of-new-positions just as the cells settle.
+  // of the pop-in animations. applyPostLayout fires the camera ease
+  // (onMorphStart) as soon as ELK has applied — decoupled from pop-in
+  // settle, so the zoom-to-fit doesn't sit idle waiting for the last
+  // edge label to fade. mxMorphing itself still waits for pop-in to
+  // settle so the snapshot captures a fully-opaque view.
   if (opts.postLayout)
   {
-    var hints = { startNodeIds: opts.startNodeIds || null, endNodeIds: opts.endNodeIds || null };
     var awaitAnims = waitForPendingAnimationsToSettle();
 
     try
     {
-      applyPostLayout(streamGraph, opts.postLayout, hints, function(applied)
+      applyPostLayout(streamGraph, opts.postLayout, function(applied)
       {
         if (!applied) return;
 
@@ -3983,20 +4358,45 @@ function finalizeStreamingView(xml, opts)
           var newXml = serializeGraphXml(streamGraph);
           if (newXml != null)
           {
-            currentXml = newXml;
-            drawioEditUrl = generateDrawioEditUrl(newXml);
+            commitDiagramXml(newXml);
           }
         }
         catch (_) {}
+
+        // Combined ELK + libavoid: ELK has placed the vertices, now route
+        // the edges around them on the final positions. Runs after the
+        // morph so it sees where things actually landed.
+        if (opts.routing)
+        {
+          runRoutingPass(streamGraph);
+        }
+
+        // Second-stage fit: cells have just morphed into place and
+        // sizeDidChange has run, so the SVG/container bounds are now
+        // final. The ELK-done fit was based on the pre-morph view
+        // dimensions; a rAF later we re-measure and adjust. If the
+        // bounds didn't move, animateCameraTo no-ops (~1 px tolerance).
+        requestAnimationFrame(function()
+        {
+          if (streamGraph == null) return;
+          resizeContainerToFit();
+          var t2 = computeFitWholeTransform();
+          if (t2 != null)
+          {
+            animateCameraTo(t2.s, t2.tx, t2.ty, 220, easeInOutCubic);
+          }
+        });
       }, function()
       {
-        // Morph is about to start. Cells are at their new positions
-        // in the model (visual still at old positions); start camera
-        // anim now so it lands in sync with the cell morph.
+        // First-stage fit: ELK has just applied, so the model has the
+        // post-layout positions. Fire the camera ease now rather than
+        // waiting for pop-in animations to settle — this is the visible
+        // zoom-to-fit, and decoupling it from the opacity gate removes
+        // the dead time between the last cell popping and the camera
+        // moving. A second adjust fires from onDone once bounds are
+        // pixel-final.
         recentVertexQueue = [];
         lastBatchSize = 0;
-        // Resize container for the new bbox first so fit-whole math
-        // is computed against the final container size.
         resizeContainerToFit();
         var t = computeFitWholeTransform();
         if (t != null)
@@ -4007,6 +4407,15 @@ function finalizeStreamingView(xml, opts)
       }, awaitAnims);
     }
     catch (e) {}
+  }
+  else if (opts.routing)
+  {
+    // Routing without ELK: the author's (LLM's) vertex positions are kept;
+    // libavoid only computes obstacle-avoiding paths for the edges. The
+    // normal fit above already ran (no postLayout), and routing doesn't move
+    // vertices, so no extra camera move is needed. applyRouting awaits router
+    // readiness internally, so no rAF gate here.
+    runRoutingPass(streamGraph);
   }
 
   notifySize('finalize');
@@ -4082,8 +4491,14 @@ function enableViewerInteractivity(graph)
   customViewerInteractive = true;
   containerEl.classList.add("custom-viewer");
 
-  var dragging = false, sx = 0, sy = 0, stx = 0, sty = 0, sscale = 1;
+  var dragging = false, dragMoved = false;
+  var sx = 0, sy = 0, stx = 0, sty = 0, sscale = 1;
   var lastClickT = 0, lastClickX = 0, lastClickY = 0;
+  // A press only becomes a pan after this much pointer travel.
+  // Cancelling the camera animation on the bare pointerdown froze an
+  // in-flight fit/zoom ease mid-flight, so a plain click during the
+  // Fit ease left the diagram at a half-way scale/offset.
+  var DRAG_START_THRESHOLD_PX = 4;
 
   containerEl.addEventListener('pointerdown', function(e)
   {
@@ -4130,13 +4545,11 @@ function enableViewerInteractivity(graph)
     lastClickY = e.clientY;
 
     dragging = true;
+    dragMoved = false;
     sx = e.clientX; sy = e.clientY;
-    // Sample current camera transform at drag start; pan rewrites
-    // tx/ty directly with immediate=true so there's no transition lag.
-    sscale = viewTransform.scale;
-    stx    = viewTransform.tx;
-    sty    = viewTransform.ty;
-    cancelZoomAnim();
+    // Camera sampling + animation cancel happen at the drag threshold
+    // in pointermove, so a press that never moves (a click) leaves an
+    // in-flight fit/zoom ease undisturbed.
     containerEl.classList.add('dragging');
     try { containerEl.setPointerCapture(e.pointerId); } catch(_) {}
   });
@@ -4144,6 +4557,28 @@ function enableViewerInteractivity(graph)
   containerEl.addEventListener('pointermove', function(e)
   {
     if (!dragging) return;
+    if (!dragMoved)
+    {
+      if (Math.abs(e.clientX - sx) < DRAG_START_THRESHOLD_PX &&
+          Math.abs(e.clientY - sy) < DRAG_START_THRESHOLD_PX)
+      {
+        return;
+      }
+      // Threshold crossed: this is a pan. Stop any camera animation
+      // and anchor the drag at the VISUALLY current transform — mid-
+      // ease, viewTransform can hold the end of an in-flight CSS
+      // transition rather than what the eye sees — then freeze it
+      // there so the takeover is jump-free.
+      dragMoved = true;
+      cancelZoomAnim();
+      var vis = readVisibleTransform(viewTransformSvg);
+      sscale = (vis != null) ? vis.scale : viewTransform.scale;
+      stx    = (vis != null) ? vis.tx    : viewTransform.tx;
+      sty    = (vis != null) ? vis.ty    : viewTransform.ty;
+      sx = e.clientX; sy = e.clientY;
+      applyViewTransform(graph, sscale, stx, sty, true);
+      return;
+    }
     var dx = (e.clientX - sx) / sscale;
     var dy = (e.clientY - sy) / sscale;
     // Clamp so the diagram can never be dragged entirely off-screen.
@@ -4160,6 +4595,13 @@ function enableViewerInteractivity(graph)
     dragging = false;
     containerEl.classList.remove('dragging');
     try { containerEl.releasePointerCapture(e.pointerId); } catch(_) {}
+    if (dragMoved)
+    {
+      dragMoved = false;
+      // The pan moved the camera off the fitted view — refresh the fit
+      // button so it offers "Fit to view" (state tracks the camera).
+      updateZoomFitButtonUi();
+    }
   };
 
   containerEl.addEventListener('pointerup', endDrag);
@@ -4188,6 +4630,184 @@ function enableViewerInteractivity(graph)
     var k = Math.abs(e.deltaY) < 50 ? 0.010 : 0.0015;
     customZoomAt(px, py, Math.exp(-e.deltaY * k));
   }, { passive: false });
+
+  // Touch gestures. Mouse stays on the pointer-event handlers above —
+  // those ignore non-mouse pointers so all touch input is owned here.
+  //   Inline + 1 finger:  passthrough — chat scrolls normally.
+  //   Inline + 2 fingers: claim — pinch zoom + pan the diagram.
+  //   Fullscreen + 1:     pan.
+  //   Fullscreen + 2:     pinch zoom + pan.
+  // preventDefault() is only called once a gesture is claimed, so a
+  // 1-finger touch in inline mode reaches the parent scroller. Once
+  // claimed, every subsequent touchmove keeps preventing default until
+  // the last finger lifts — so raising one finger of a two-finger
+  // pinch never falls through to a surprise page scroll.
+  var touchPan = null;     // { sx, sy, sscale, stx, sty }
+  var touchPinch = null;   // { startDist, startMidX, startMidY, startScale, startTx, startTy }
+  var touchClaimed = false;
+
+  function touchPointsRel(touchList)
+  {
+    var rect = containerEl.getBoundingClientRect();
+    var arr = [];
+    for (var i = 0; i < touchList.length; i++)
+    {
+      arr.push({
+        x: touchList[i].clientX - rect.left,
+        y: touchList[i].clientY - rect.top
+      });
+    }
+    return arr;
+  }
+
+  function startPinch(touches)
+  {
+    var pts = touchPointsRel(touches);
+    var dx = pts[1].x - pts[0].x;
+    var dy = pts[1].y - pts[0].y;
+    touchPinch = {
+      startDist: Math.max(1, Math.hypot(dx, dy)),
+      startMidX: (pts[0].x + pts[1].x) / 2,
+      startMidY: (pts[0].y + pts[1].y) / 2,
+      startScale: viewTransform.scale,
+      startTx: viewTransform.tx,
+      startTy: viewTransform.ty
+    };
+  }
+
+  function startPan(touch)
+  {
+    touchPan = {
+      sx: touch.clientX,
+      sy: touch.clientY,
+      sscale: viewTransform.scale,
+      stx: viewTransform.tx,
+      sty: viewTransform.ty
+    };
+  }
+
+  containerEl.addEventListener('touchstart', function(e)
+  {
+    var fullscreen = currentDisplayMode === 'fullscreen';
+
+    // Cancel any in-flight rAF camera animation on ANY touchstart,
+    // even ones we won't claim. Without this, a still-running anim
+    // (e.g. the post-streaming fit-settle or a recent toolbar zoom)
+    // keeps painting while the browser claims the gesture for chat
+    // scroll — visible as the viewer "panning a short distance" at
+    // the start of an inline drag.
+    cancelZoomAnim();
+
+    if (e.touches.length >= 2)
+    {
+      e.preventDefault();
+      touchClaimed = true;
+      touchPan = null;
+      startPinch(e.touches);
+    }
+    else if (e.touches.length === 1 && fullscreen)
+    {
+      e.preventDefault();
+      touchClaimed = true;
+      startPan(e.touches[0]);
+    }
+  }, { passive: false });
+
+  containerEl.addEventListener('touchmove', function(e)
+  {
+    if (!touchClaimed) return;
+    e.preventDefault();
+
+    if (touchPinch != null && e.touches.length >= 2)
+    {
+      var pts = touchPointsRel(e.touches);
+      var dx = pts[1].x - pts[0].x;
+      var dy = pts[1].y - pts[0].y;
+      var dist = Math.max(1, Math.hypot(dx, dy));
+      var midX = (pts[0].x + pts[1].x) / 2;
+      var midY = (pts[0].y + pts[1].y) / 2;
+
+      var newScale = Math.max(0.05, Math.min(4,
+        touchPinch.startScale * (dist / touchPinch.startDist)));
+
+      // Keep the model point that was under the start midpoint
+      // anchored under the current midpoint — same invariant as
+      // customZoomAt, but with a moving anchor.
+      var modelX = touchPinch.startMidX / touchPinch.startScale - touchPinch.startTx;
+      var modelY = touchPinch.startMidY / touchPinch.startScale - touchPinch.startTy;
+      var newTx = midX / newScale - modelX;
+      var newTy = midY / newScale - modelY;
+
+      var c = clampPan(newScale, newTx, newTy);
+      applyViewTransform(graph, newScale, c.tx, c.ty, true);
+      markUserZoomed();
+    }
+    else if (e.touches.length === 1
+             && currentDisplayMode === 'fullscreen')
+    {
+      // Lazy rebase: if a pinch just ended (touchPan was nulled in
+      // endTouch on the 2→1 transition), we capture the baseline
+      // HERE using this touchmove's own clientX/Y. iOS reports
+      // slightly different clientX/Y for the same finger between
+      // a touchend and the next touchmove (event coalescing /
+      // retiming), so eagerly capturing in endTouch produces a
+      // small offset jump on the first pan frame. Capturing here
+      // makes the first frame's ddx/ddy exactly zero by construction.
+      if (touchPan == null)
+      {
+        startPan(e.touches[0]);
+        return;
+      }
+      var t = e.touches[0];
+      var ddx = (t.clientX - touchPan.sx) / touchPan.sscale;
+      var ddy = (t.clientY - touchPan.sy) / touchPan.sscale;
+      var c2 = clampPan(touchPan.sscale,
+        touchPan.stx + ddx, touchPan.sty + ddy);
+      applyViewTransform(graph, touchPan.sscale, c2.tx, c2.ty, true);
+    }
+  }, { passive: false });
+
+  function endTouch(e)
+  {
+    if (e.touches.length === 0)
+    {
+      touchPan = null;
+      touchPinch = null;
+      touchClaimed = false;
+      // Touch pans (and the eager touchstart animation cancel) can
+      // leave the camera off the fitted view — refresh the fit button.
+      updateZoomFitButtonUi();
+    }
+    else if (e.touches.length === 1 && touchPinch != null)
+    {
+      // Lifted one of two fingers. End the pinch and drop the pan
+      // baseline — the next touchmove will lazily rebaseline using
+      // its own event coordinates (see touchmove handler), avoiding
+      // the iOS touchend↔touchmove clientX/Y skew.
+      touchPinch = null;
+      touchPan = null;
+    }
+  }
+
+  containerEl.addEventListener('touchend', endTouch);
+  containerEl.addEventListener('touchcancel', endTouch);
+
+  // iOS Safari / WKWebView fires non-standard gesture events alongside
+  // touch events when it detects a two-finger gesture. Once WebKit
+  // decides the gesture is "page pinch zoom", it fires touchcancel on
+  // our touchmoves — the user reports this as "pinch starts and then
+  // immediately stops". Preventing the gesture events keeps the touch
+  // stream alive so our touch handlers can do the math.
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function(name)
+  {
+    containerEl.addEventListener(name, function(e)
+    {
+      if (currentDisplayMode === 'fullscreen' || touchClaimed)
+      {
+        e.preventDefault();
+      }
+    }, { passive: false });
+  });
 }
 
 /**
@@ -4213,6 +4833,19 @@ function customZoomAt(px, py, factor)
     px / newScale - gx,
     py / newScale - gy,
     true);
+  markUserZoomed();
+}
+
+// Flip the zoom-fit toggle to "fit" state. Called by every zoom path
+// EXCEPT the fit path itself, so any manual zoom (wheel, pinch,
+// toolbar +/-, dblclick zoom-in) leaves the button offering "Fit to
+// view" as the natural next action. Guarded so wheel-rate updates
+// don't churn the DOM.
+function markUserZoomed()
+{
+  if (dblclickZoomedIn) return;
+  dblclickZoomedIn = true;
+  updateZoomFitButtonUi();
 }
 
 /**
@@ -4282,7 +4915,7 @@ function readVisibleTransform(svg)
   var t;
   try { t = window.getComputedStyle(svg).transform; } catch (_) { return null; }
   if (!t || t === 'none') return null;
-  var m = t.match(/matrix\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+)\s*\)/);
+  var m = t.match(/matrix\\(\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+)\\s*\\)/);
   if (!m) return null;
   var a = parseFloat(m[1]);
   var b = parseFloat(m[2]);
@@ -4377,7 +5010,13 @@ function animateCameraTo(toS, toTx, toTy, dur, easing)
       var tx = fromTx + (toTx - fromTx) * k;
       var ty = fromTy + (toTy - fromTy) * k;
       applyViewTransform(streamGraph, fromS, tx, ty, true);
-      if (t < 1) zoomAnimRaf = requestAnimationFrame(stepPan);
+      if (t < 1)
+      {
+        zoomAnimRaf = requestAnimationFrame(stepPan);
+        return;
+      }
+      // Landed — refresh the fit button (its state tracks the camera).
+      updateZoomFitButtonUi();
     };
     zoomAnimRaf = requestAnimationFrame(stepPan);
     return;
@@ -4399,7 +5038,13 @@ function animateCameraTo(toS, toTx, toTy, dur, easing)
     var tx = anchorPx / s - anchorMx;
     var ty = anchorPy / s - anchorMy;
     applyViewTransform(streamGraph, s, tx, ty, true);
-    if (t < 1) zoomAnimRaf = requestAnimationFrame(step);
+    if (t < 1)
+    {
+      zoomAnimRaf = requestAnimationFrame(step);
+      return;
+    }
+    // Landed — refresh the fit button (its state tracks the camera).
+    updateZoomFitButtonUi();
   };
 
   zoomAnimRaf = requestAnimationFrame(step);
@@ -4424,6 +5069,7 @@ function customZoomToScaleAt(px, py, targetScale)
   // can't push the bbox so far off-screen there's no recovery.
   var c = clampPan(toS, toTx, toTy);
   animateCameraTo(toS, c.tx, c.ty, 320);
+  markUserZoomed();
 }
 
 /**
@@ -4493,6 +5139,23 @@ function computeFitWholeTransform()
 }
 
 /**
+ * True when the live camera already shows the fit-whole view (same
+ * ~1 px / 0.3% tolerance as animateCameraTo's no-op check). A null fit
+ * target (no graph, hidden container) counts as fitted. Lets the fit
+ * button track the CAMERA rather than just the zoom toggle — a mouse
+ * pan or an interrupted ease must flip it back to "Fit to view".
+ */
+function cameraAtFitWhole()
+{
+  var t = computeFitWholeTransform();
+  if (t == null) return true;
+  var s = Math.max(viewTransform.scale, t.s);
+  return Math.abs(viewTransform.scale - t.s) < 0.003 &&
+         Math.abs(viewTransform.tx - t.tx) * s < 1.5 &&
+         Math.abs(viewTransform.ty - t.ty) * s < 1.5;
+}
+
+/**
  * Compute the scale that fit-whole would settle at, given the current
  * container size and model bbox. Used by the dblclick toggle to decide
  * whether 100 % or 200 % is the meaningful "zoomed-in" target.
@@ -4532,21 +5195,15 @@ function fitToWidthScale()
 
 /**
  * Target scale for the "zoom in from fit" toggle (toolbar button and
- * dblclick when not zoomed in). Rules, keyed off the current fit-whole
- * scale (i.e. how zoomed-out the diagram is at fit):
- *   - fit-whole >= 100%: tiny diagram already at 100% — bump to 200%
- *     so the toggle isn't a visual no-op.
- *   - fit-whole > 60%: fit is already a comfortable read — jump to 100%.
- *   - fit-whole <= 60%: zoom in to at least 60%. Prefer fit-to-width
- *     when it's larger than 60%, so tall/narrow diagrams show their
- *     full horizontal extent without arbitrarily cropping the sides.
+ * dblclick when not zoomed in). Always 120% so the toggle is a
+ * meaningful close-up read; if fit-whole is already at or past 120%
+ * (tiny diagrams), bump to 200% so the toggle isn't a visual no-op.
  */
 function zoomInTargetScale()
 {
   var fitW = fitWholeScale();
-  if (fitW >= 0.999) return 2.0;
-  if (fitW > 0.6) return 1.0;
-  return Math.max(0.6, fitToWidthScale());
+  if (fitW >= 1.2) return 2.0;
+  return 1.2;
 }
 
 /**
@@ -4590,12 +5247,12 @@ function computeTopAnchoredTransform(targetScale)
 // them when the user toggles back to "none". Without this we'd lose
 // the original layout permanently after the first ELK pass.
 var originalCellGeometries = null;
-// Edge styles are mutated by normalizeEdgesToRounded in the layered
-// ELK path (curved=1 → rounded=1, no curve). Restoring geometries
+// Edge styles are mutated by the layered ELK pass (the ElkLayout facade
+// rewrites curved=1 → rounded=1 and upgrades to orthogonalEdgeStyle).
+// Restoring geometries
 // alone leaves edges drawn as right-angles when toggling back to "as
 // authored", so we capture styles too.
 var originalCellStyles = null;
-var lastLayoutHints = null;
 var currentLayoutState = 'none'; // 'none' | 'horizontal' | 'vertical'
 var layoutAlternativeState = 'vertical'; // 'horizontal' | 'vertical' for the current diagram
 
@@ -4634,8 +5291,8 @@ function restoreOriginalGeometriesToModel(model)
     var cell = model.getCell(id);
     if (cell == null) continue;
     model.setGeometry(cell, originalCellGeometries[id].clone());
-    // Restore style if it differs (normalizeEdgesToRounded may have
-    // mutated edge styles during a layered ELK pass).
+    // Restore style if it differs (the layered ELK pass may have
+    // mutated edge styles).
     if (originalCellStyles != null)
     {
       var origStyle = originalCellStyles[id];
@@ -4698,11 +5355,13 @@ function applyLayoutChange(targetState)
       {
         model.endUpdate();
         try { streamGraph.sizeDidChange(); } catch (_) {}
-        // Re-hide and pen-draw edges (same pattern as applyPostLayout).
+        // Re-hide and fade edges back in. The streaming-style
+        // topological pen-draw feels too slow here, so we just fade
+        // every edge in together once the vertex morph is done.
         hideAllEdgesForMorph(streamGraph);
         requestAnimationFrame(function()
         {
-          penDrawAllEdgesAfterMorph(streamGraph);
+          fadeInAllEdgesAfterMorph(streamGraph);
         });
         notifySize('layout-change');
         try { containerEl.classList.remove('morph-active'); } catch (_) {}
@@ -4711,8 +5370,7 @@ function applyLayoutChange(targetState)
           var newXml = serializeGraphXml(streamGraph);
           if (newXml != null)
           {
-            currentXml = newXml;
-            drawioEditUrl = generateDrawioEditUrl(newXml);
+            commitDiagramXml(newXml);
           }
         }
         catch (_) {}
@@ -4721,6 +5379,8 @@ function applyLayoutChange(targetState)
       // Parallel camera anim — same pattern as the postLayout finalize.
       recentVertexQueue = [];
       lastBatchSize = 0;
+      dblclickZoomedIn = false;
+      updateZoomFitButtonUi();
       resizeContainerToFit();
       var t = computeFitWholeTransform();
       if (t != null)
@@ -4747,14 +5407,13 @@ function applyLayoutChange(targetState)
 
   // 'horizontal' or 'vertical' — run ELK with mxMorphing.
   var algorithm = (targetState === 'vertical') ? 'verticalFlow' : 'horizontalFlow';
-  var hints = lastLayoutHints || {};
   var prevState = currentLayoutState;
   currentLayoutState = targetState;
   updateLayoutButtonUi();
 
   try
   {
-    applyPostLayout(streamGraph, algorithm, hints,
+    applyPostLayout(streamGraph, algorithm,
       function(applied)
       {
         if (!applied)
@@ -4769,8 +5428,7 @@ function applyLayoutChange(targetState)
           var newXml = serializeGraphXml(streamGraph);
           if (newXml != null)
           {
-            currentXml = newXml;
-            drawioEditUrl = generateDrawioEditUrl(newXml);
+            commitDiagramXml(newXml);
           }
         }
         catch (_) {}
@@ -4780,13 +5438,17 @@ function applyLayoutChange(targetState)
         // onMorphStart: parallel camera anim.
         recentVertexQueue = [];
         lastBatchSize = 0;
+        dblclickZoomedIn = false;
+        updateZoomFitButtonUi();
         resizeContainerToFit();
         var t = computeFitWholeTransform();
         if (t != null)
         {
           animateCameraTo(t.s, t.tx, t.ty, 360, easeInOutCubic);
         }
-      });
+      },
+      undefined /* awaitBeforeMorph */,
+      true /* fadeEdges — button-driven re-layout uses fast fade */);
   }
   catch (e)
   {
@@ -4795,15 +5457,17 @@ function applyLayoutChange(targetState)
   }
 }
 
-// Sync the zoom/fit toolbar button's icon + title with dblclickZoomedIn.
-// dblclickZoomedIn=false → button offers "zoom in"; true → offers "fit".
+// Sync the zoom/fit toolbar button's icon + title with the view state:
+// "Fit to view" whenever the user zoomed in (dblclickZoomedIn) OR the
+// camera sits anywhere off the fit-whole view (pan, interrupted ease);
+// "zoom in" (1:1) only when the diagram is actually fitted.
 function updateZoomFitButtonUi()
 {
   var iconZoomIn = document.getElementById('zoom-fit-icon-zoomin');
   var iconFit = document.getElementById('zoom-fit-icon-fit');
   var btn = document.getElementById('zoom-fit-btn');
   if (btn == null) return;
-  if (dblclickZoomedIn)
+  if (dblclickZoomedIn || !cameraAtFitWhole())
   {
     if (iconZoomIn) iconZoomIn.style.display = 'none';
     if (iconFit) iconFit.style.display = '';
@@ -4876,6 +5540,14 @@ function showMermaidTextPreview(partialMermaid)
  */
 function handleMermaidPartial(partialMermaid)
 {
+  // No layout → no visible animation, and DOM measurement reads 0x0
+  // (zero-sized nodes). Skip streaming previews entirely while hidden;
+  // the finalize paths gate on whenDocumentLaidOut() and parse the
+  // authoritative text with healthy measurement once the host shows
+  // the iframe. If the iframe becomes visible mid-stream, the next
+  // partial resumes the preview naturally.
+  if (!isDocumentLaidOut()) return;
+
   // Need the viewer + parser before we can render anything
   if (typeof Graph === 'undefined' || typeof mxUtils === 'undefined' ||
       typeof mxMermaidToDrawio === 'undefined' ||
@@ -4901,9 +5573,9 @@ function handleMermaidPartial(partialMermaid)
   var xml;
   try
   {
-    xml = mxMermaidToDrawio.parseText(healed, {
-      theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'default'
-    });
+    // 'default' = light-dark() adaptive palette, correct in both light and
+    // dark hosts (see convertMermaidToXml for the rationale).
+    xml = mxMermaidToDrawio.parseText(healed, { theme: 'default' });
   }
   catch (e)
   {
@@ -5050,7 +5722,7 @@ app.ontoolinputpartial = function(params)
   {
     handleMermaidPartial(partialMermaid);
 
-    // Once any sibling key (postLayout, startNodeIds, endNodeIds) appears
+    // Once any sibling key (e.g. postLayout) appears
     // in params.arguments, the JSON parser must have closed the mermaid
     // string — those keys come *after* mermaid in the schema, so they
     // can't surface until its closing quote was processed. That means
@@ -5075,24 +5747,19 @@ app.ontoolinputpartial = function(params)
       if (hasSibling)
       {
         mermaidEarlyFinalizeFired = true;
-        var earlyPostLayout = args.postLayout || null;
-        if (earlyPostLayout === 'horizontalFlow' &&
-            mermaidHasTitleFrontmatter(partialMermaid))
-        {
-          earlyPostLayout = null;
-        }
+        // Mermaid path: direction comes from the flowchart code, not args.direction.
+        var earlyPostLayout = resolvePostLayout(args.postLayout, args.direction, partialMermaid);
         var earlyOpts = {
           skipIntroAnim: true,
           fadeIn: true,
           postLayout: earlyPostLayout,
-          startNodeIds: args.startNodeIds || null,
-          endNodeIds: args.endNodeIds || null,
           replaceMode: true,
           isFlowchart: isMermaidFlowchart(partialMermaid),
           isHorizontal: isMermaidHorizontalFlowchart(partialMermaid)
         };
 
         waitForGraphViewer()
+          .then(whenDocumentLaidOut)
           .then(function() { return convertMermaidToXml(partialMermaid); })
           .then(function(xml) { finalizeStreamingView(xml, earlyOpts); })
           .catch(function(_e)
@@ -5120,6 +5787,8 @@ app.ontoolinputpartial = function(params)
   {
     return;
   }
+
+  healedXml = absolutizeImageUrls(healedXml);
 
   // Update loading text during streaming
   if (loadingEl.style.display !== 'none')
@@ -5224,20 +5893,15 @@ app.ontoolinputpartial = function(params)
 app.ontoolinput = function(params)
 {
   var args = (params && params.arguments) || {};
-  var postLayout = args.postLayout || null;
-  var startNodeIds = args.startNodeIds || null;
-  var endNodeIds = args.endNodeIds || null;
-
   var mermaidText = args.mermaid;
 
-  if (postLayout === 'horizontalFlow' &&
-      mermaidText != null && typeof mermaidText === 'string' &&
-      mermaidHasTitleFrontmatter(mermaidText))
-  {
-    postLayout = null;
-  }
+  // For Mermaid, direction is derived from the flowchart code; for XML, from
+  // the optional direction field. resolvePostLayout maps elk to vertical or
+  // horizontalFlow accordingly and passes other algorithms through.
+  var postLayout = resolvePostLayout(args.postLayout, args.direction,
+    (typeof mermaidText === 'string') ? mermaidText : null);
 
-  var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout, startNodeIds: startNodeIds, endNodeIds: endNodeIds };
+  var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout };
 
   if (mermaidText != null && typeof mermaidText === 'string')
   {
@@ -5249,6 +5913,7 @@ app.ontoolinput = function(params)
     });
 
     waitForGraphViewer()
+      .then(whenDocumentLaidOut)
       .then(function() { return convertMermaidToXml(mermaidText); })
       .then(function(xml) { finalizeStreamingView(xml, mermaidOpts); })
       .catch(function(e)
@@ -5270,6 +5935,9 @@ app.ontoolinput = function(params)
   {
     return;
   }
+
+  // Plain-XML diagram: ensure no stale Mermaid source wraps the export.
+  currentMermaidText = null;
 
   try
   {
@@ -5302,13 +5970,13 @@ app.ontoolresult = function(result)
 
   if (textBlock && textBlock.type === "text")
   {
-    // Unified payload: {xml|mermaid, postLayout, startNodeIds, endNodeIds, _version} as JSON.
+    // Unified payload: {xml|mermaid, postLayout, direction + routing (XML only), _buildId} as JSON.
     // Fall back to treating the raw text as XML if JSON parsing fails.
     var mermaidText = null;
     var xmlText = null;
     var postLayout = null;
-    var startNodeIds = null;
-    var endNodeIds = null;
+    var direction = null;
+    var routing = null;
 
     try
     {
@@ -5318,20 +5986,13 @@ app.ontoolresult = function(result)
       {
         mermaidText = parsed.mermaid;
         postLayout = parsed.postLayout || null;
-        startNodeIds = parsed.startNodeIds || null;
-        endNodeIds = parsed.endNodeIds || null;
-        if (postLayout === 'horizontalFlow' &&
-            mermaidHasTitleFrontmatter(mermaidText))
-        {
-          postLayout = null;
-        }
       }
       else if (parsed && typeof parsed.xml === 'string')
       {
         xmlText = parsed.xml;
         postLayout = parsed.postLayout || null;
-        startNodeIds = parsed.startNodeIds || null;
-        endNodeIds = parsed.endNodeIds || null;
+        direction = parsed.direction || null;
+        routing = parsed.routing || null;
       }
     }
     catch (e)
@@ -5339,7 +6000,12 @@ app.ontoolresult = function(result)
       // Not JSON — treat the raw text as XML
     }
 
-    var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout, startNodeIds: startNodeIds, endNodeIds: endNodeIds };
+    // Mermaid: direction from the flowchart code; XML: from the direction field.
+    postLayout = resolvePostLayout(postLayout, direction, mermaidText);
+    // routing is "libavoid" (obstacle-avoiding edge routing) or null — XML only.
+    routing = (routing === 'libavoid') ? 'libavoid' : null;
+
+    var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout, routing: routing };
 
     if (mermaidText != null)
     {
@@ -5351,6 +6017,7 @@ app.ontoolresult = function(result)
       });
 
       waitForGraphViewer()
+        .then(whenDocumentLaidOut)
         .then(function() { return convertMermaidToXml(mermaidText); })
         .then(function(xml) { finalizeStreamingView(xml, mermaidOpts); })
         .catch(function(e)
@@ -5362,6 +6029,9 @@ app.ontoolresult = function(result)
     {
       var rawXml = xmlText != null ? xmlText : textBlock.text;
       var normalizedXml = normalizeDiagramXml(rawXml);
+
+      // Plain-XML diagram: ensure no stale Mermaid source wraps the export.
+      currentMermaidText = null;
 
       if (normalizedXml)
       {
@@ -5489,7 +6159,10 @@ document.getElementById('zoom-out-btn').addEventListener('click', function()
 document.getElementById('zoom-fit-btn').addEventListener('click', function()
 {
   if (streamGraph == null) return;
-  if (dblclickZoomedIn)
+  // Fit whenever the camera is off the fitted view — regardless of how
+  // it got there (zoom toggle, mouse pan, interrupted ease). Only when
+  // the diagram is already fitted does the button zoom in.
+  if (dblclickZoomedIn || !cameraAtFitWhole())
   {
     customFitView();
     return;
@@ -5666,13 +6339,30 @@ export function processMermaidBundle(raw)
 }
 
 /**
- * Process the drawio-elk bundle. Bundle ships as ESM with a default export
- * (the ELK class). Alias to `var ELK` so drawio-mermaid and mxElkLayout
- * can read it from globalThis as before.
+ * Process the drawio-elk bundle. Two bundle formats have shipped:
+ *
+ *   - ESM: ends with `export { default, ElkLayout, ElkAdapter, ElkApplier }`.
+ *     Stripped + IIFE-wrapped + aliased to globalThis here.
+ *   - IIFE: self-contained, ends with `var ELK=(()=>{...})(); var ElkLayout=ELK.ElkLayout,...; ELK=ELK.default;`.
+ *     Already publishes the four globals; pass through as-is.
+ *
+ * Detect which format by looking for an `export {...}` statement.
  */
 export function processElkBundle(raw)
 {
-  return stripEsmExportsAndAlias(raw, { ELK: "default" }, "drawio-elk.min.js");
+  if (!/export\s*\{[^}]*\}/.test(raw))
+  {
+    return raw;
+  }
+
+  return stripEsmExportsAndAlias(raw,
+    {
+      ELK: "default",
+      ElkLayout: "ElkLayout",
+      ElkAdapter: "ElkAdapter",
+      ElkApplier: "ElkApplier"
+    },
+    "drawio-elk.min.js");
 }
 
 // ── Diagram validation ───────────────────────────────────────────────────────
@@ -5817,382 +6507,7 @@ function validateDiagramXml(xml)
   return { errors: errors, warnings: warnings };
 }
 
-// ── Shape search ─────────────────────────────────────────────────────────────
-
-/**
- * Soundex phonetic encoding — matches the implementation in draw.io's Editor.js.
- * Returns a 4-character code (letter + 3 digits).
- */
-function soundex(name)
-{
-  if (name == null || name.length === 0)
-  {
-    return "";
-  }
-
-  var s = [];
-  var si = 1;
-  var mappings = "01230120022455012603010202";
-
-  s[0] = name[0].toUpperCase();
-
-  for (var i = 1, l = name.length; i < l; i++)
-  {
-    var c = name[i].toUpperCase().charCodeAt(0) - 65;
-
-    if (c >= 0 && c <= 25)
-    {
-      if (mappings[c] !== "0")
-      {
-        if (mappings[c] !== s[si - 1])
-        {
-          s[si] = mappings[c];
-          si++;
-        }
-
-        if (si > 3)
-        {
-          break;
-        }
-      }
-    }
-  }
-
-  while (si <= 3)
-  {
-    s[si] = "0";
-    si++;
-  }
-
-  return s.join("");
-}
-
-/**
- * Build a tag-to-entries lookup from the flat shape index array.
- * Each tag (and its Soundex equivalent) maps to a Set of indices.
- *
- * @param {Array} shapeIndex - Array of {style, w, h, title, tags, type}.
- * @returns {Object} tagMap - { tag: Set<number> }
- */
-function buildTagMap(shapeIndex)
-{
-  var tagMap = {};
-
-  for (var i = 0; i < shapeIndex.length; i++)
-  {
-    var rawTags = shapeIndex[i].tags;
-
-    if (!rawTags)
-    {
-      continue;
-    }
-
-    var tokens = rawTags.toLowerCase().replace(/[\/,()]/g, " ").split(" ");
-    var seen = {};
-
-    for (var j = 0; j < tokens.length; j++)
-    {
-      var token = tokens[j];
-
-      if (token.length < 2 || seen[token])
-      {
-        continue;
-      }
-
-      seen[token] = true;
-
-      if (!tagMap[token])
-      {
-        tagMap[token] = new Set();
-      }
-
-      tagMap[token].add(i);
-
-      // Also index by Soundex
-      var sx = soundex(token.replace(/\.*\d*$/, ""));
-
-      if (sx && sx !== token && !seen[sx])
-      {
-        seen[sx] = true;
-
-        if (!tagMap[sx])
-        {
-          tagMap[sx] = new Set();
-        }
-
-        tagMap[sx].add(i);
-      }
-    }
-  }
-
-  return tagMap;
-}
-
-/**
- * Split a token on camelCase and letter-digit boundaries.
- * e.g. "pid2misc" → ["pid", "misc"], "pid2inst" → ["pid", "inst"],
- *      "discInst" → ["disc", "inst"], "hello" → ["hello"]
- *
- * @param {string} token - A single query token.
- * @returns {Array<string>} Sub-tokens (lowercased, length >= 2 only).
- */
-function splitCompoundToken(token)
-{
-  // Split on: digit-to-letter, letter-to-digit, lowercase-to-uppercase
-  var parts = token.replace(/([a-z])([A-Z])/g, "$1 $2")
-                   .replace(/([a-zA-Z])(\d)/g, "$1 $2")
-                   .replace(/(\d)([a-zA-Z])/g, "$1 $2")
-                   .toLowerCase()
-                   .split(/\s+/);
-
-  return parts.filter(function(p) { return p.length >= 2; });
-}
-
-/**
- * Collect all shape indices that match a single term (exact + Soundex).
- * Returns an object with separate exact and phonetic sets.
- *
- * @param {Object} tagMap - Pre-built tag→indices map.
- * @param {string} term - A single search term (lowercase).
- * @returns {{ exact: Set<number>, phonetic: Set<number> }}
- */
-function matchTerm(tagMap, term)
-{
-  var exact = new Set();
-  var phonetic = new Set();
-
-  var exactHits = tagMap[term];
-
-  if (exactHits)
-  {
-    exactHits.forEach(function(idx) { exact.add(idx); });
-  }
-
-  var sx = soundex(term.replace(/\.*\d*$/, ""));
-
-  if (sx && sx !== term)
-  {
-    var phoneticHits = tagMap[sx];
-
-    if (phoneticHits)
-    {
-      phoneticHits.forEach(function(idx)
-      {
-        if (!exact.has(idx))
-        {
-          phonetic.add(idx);
-        }
-      });
-    }
-  }
-
-  return { exact: exact, phonetic: phonetic };
-}
-
-/**
- * Search the shape index with scored ranking and graceful fallback.
- *
- * Algorithm:
- * 1. Normalize query terms (split camelCase/digit boundaries)
- * 2. Try strict AND across all terms
- * 3. If AND produces results → score and rank them
- * 4. If AND produces nothing → fall back to scored OR (best partial matches)
- *
- * Scoring counts distinct query terms matched (primary) with a small
- * bonus for exact over Soundex matches (tiebreaker).
- * Score per term: +1.0 for exact tag match, +0.5 for Soundex-only match.
- *
- * @param {Array} shapeIndex - The flat shape array.
- * @param {Object} tagMap - Pre-built tag→indices map from buildTagMap().
- * @param {string} query - Space-separated search terms.
- * @param {number} limit - Maximum results to return.
- * @returns {Array} Matching shapes: [{style, w, h, title}].
- */
-function searchShapes(shapeIndex, tagMap, query, limit)
-{
-  if (!query || !shapeIndex || shapeIndex.length === 0)
-  {
-    return [];
-  }
-
-  // Normalize: split compound tokens like "pid2misc" → ["pid", "misc"]
-  var rawTerms = query.toLowerCase().split(/\s+/).filter(function(t) { return t.length > 0; });
-  var terms = [];
-  var seen = {};
-
-  for (var i = 0; i < rawTerms.length; i++)
-  {
-    var subTokens = splitCompoundToken(rawTerms[i]);
-
-    // If splitting produced nothing useful, keep the original if long enough
-    if (subTokens.length === 0 && rawTerms[i].length >= 2)
-    {
-      subTokens = [rawTerms[i]];
-    }
-
-    for (var j = 0; j < subTokens.length; j++)
-    {
-      if (!seen[subTokens[j]])
-      {
-        seen[subTokens[j]] = true;
-        terms.push(subTokens[j]);
-      }
-    }
-  }
-
-  if (terms.length === 0)
-  {
-    return [];
-  }
-
-  // Collect per-term match sets
-  var termMatches = [];
-
-  for (var i = 0; i < terms.length; i++)
-  {
-    termMatches.push(matchTerm(tagMap, terms[i]));
-  }
-
-  // Try strict AND first
-  var andSet = null;
-
-  for (var i = 0; i < termMatches.length; i++)
-  {
-    var combined = new Set();
-
-    termMatches[i].exact.forEach(function(idx) { combined.add(idx); });
-    termMatches[i].phonetic.forEach(function(idx) { combined.add(idx); });
-
-    if (andSet === null)
-    {
-      andSet = combined;
-    }
-    else
-    {
-      var intersection = new Set();
-
-      andSet.forEach(function(idx)
-      {
-        if (combined.has(idx))
-        {
-          intersection.add(idx);
-        }
-      });
-
-      andSet = intersection;
-    }
-
-    if (andSet.size === 0)
-    {
-      break;
-    }
-  }
-
-  // Score all candidates — either AND results or OR fallback
-  // Per term: +1.0 for exact match, +0.5 for Soundex-only match
-  // Each shape can only score once per term (exact wins over Soundex)
-  var scores = {};
-
-  if (andSet && andSet.size > 0)
-  {
-    // AND succeeded: score only the AND results
-    andSet.forEach(function(idx)
-    {
-      scores[idx] = 0;
-    });
-
-    for (var i = 0; i < termMatches.length; i++)
-    {
-      // Track which AND candidates got an exact match for this term
-      var exactForTerm = new Set();
-
-      termMatches[i].exact.forEach(function(idx)
-      {
-        if (scores[idx] !== undefined)
-        {
-          scores[idx] += 1.0;
-          exactForTerm.add(idx);
-        }
-      });
-
-      termMatches[i].phonetic.forEach(function(idx)
-      {
-        if (scores[idx] !== undefined && !exactForTerm.has(idx))
-        {
-          scores[idx] += 0.5;
-        }
-      });
-    }
-  }
-  else
-  {
-    // AND failed: fall back to OR — score every shape that matches any term
-    for (var i = 0; i < termMatches.length; i++)
-    {
-      var exactForTerm = new Set();
-
-      termMatches[i].exact.forEach(function(idx)
-      {
-        if (scores[idx] === undefined)
-        {
-          scores[idx] = 0;
-        }
-
-        scores[idx] += 1.0;
-        exactForTerm.add(idx);
-      });
-
-      termMatches[i].phonetic.forEach(function(idx)
-      {
-        if (!exactForTerm.has(idx))
-        {
-          if (scores[idx] === undefined)
-          {
-            scores[idx] = 0;
-          }
-
-          scores[idx] += 0.5;
-        }
-      });
-    }
-  }
-
-  // Sort by score descending, then by title alphabetically
-  var candidates = Object.keys(scores).map(function(idx)
-  {
-    return { idx: parseInt(idx, 10), score: scores[idx] };
-  });
-
-  candidates.sort(function(a, b)
-  {
-    if (b.score !== a.score)
-    {
-      return b.score - a.score;
-    }
-
-    var titleA = shapeIndex[a.idx].title || "";
-    var titleB = shapeIndex[b.idx].title || "";
-
-    return titleA.localeCompare(titleB);
-  });
-
-  // Convert to result objects
-  var results = [];
-
-  for (var i = 0; i < candidates.length && results.length < limit; i++)
-  {
-    var shape = shapeIndex[candidates[i].idx];
-
-    results.push({
-      style: shape.style,
-      w: shape.w,
-      h: shape.h,
-      title: shape.title
-    });
-  }
-
-  return results;
-}
+// ── Shape search ── imported from ../../shared/shape-search.js (buildTagMap, searchShapes)
 
 // ── Server ───────────────────────────────────────────────────────────────────
 
@@ -6205,18 +6520,15 @@ function searchShapes(shapeIndex, tagMap, query, limit)
  * @param {string} [options.xmlReference] - XML generation reference text for the tool description.
  * @param {string} [options.mermaidReference] - Mermaid syntax reference text appended to the tool description.
  * @param {Array} [options.shapeIndex] - Shape search index array from search-index.json.
- * @param {object} [options.serverOptions] - Optional McpServer constructor options (e.g. jsonSchemaValidator).
+ * @param {string|null} [options.iconServiceUrl] - Base URL of the draw.io icon service used to supplement sparse search_shapes results (default: icons.diagrams.net). Pass null to disable icon supplementation.
+ * @param {string} [options.buildId] - Build identifier (git SHA + timestamp). Echoed back in every tool response as `_buildId` so you can confirm which deploy you're hitting.
  * @returns {McpServer}
  */
 export function createServer(html, options = {})
 {
-  const { domain, xmlReference = "", mermaidReference = "", shapeIndex = null, serverOptions = {} } = typeof options === "object" && options !== null
-    ? options
-    : { serverOptions: options };
-  const server = new McpServer(
-    { name: "drawio-mcp-app", version: "1.0.0" },
-    serverOptions,
-  );
+  const { domain, xmlReference = "", mermaidReference = "", shapeIndex = null,
+    iconServiceUrl = DEFAULT_ICON_SERVICE_URL, buildId = "unknown" } = options;
+  const server = new McpServer({ name: "drawio-mcp-app", version: "1.0.0" });
 
   const resourceUri = "ui://drawio/mcp-app.html";
 
@@ -6266,9 +6578,9 @@ export function createServer(html, options = {})
         "- **UML class / component / deployment diagrams** where positioning carries meaning\n" +
         "- **Venn diagrams, quadrant charts, concept maps** with custom regions — anything where hand-placed geometry is the point\n" +
         "- **Any diagram requiring specific colors, fonts, stencils, or layouts** that Mermaid can't control precisely\n" +
-        "Call `search_shapes` first when you need industry icons (AWS / Azure / Cisco / P&ID / Kubernetes / floorplan / mockup / electrical) to find the correct `style` string for each shape.\n\n" +
+        "Call `search_shapes` first when you need industry icons (AWS / Azure / Cisco / P&ID / Kubernetes / floorplan / mockup / electrical) or brand logos / pictorial concept icons (e.g. 'react', 'slack', 'shopping cart') to find the correct `style` string for each shape.\n\n" +
         "---\n\n" +
-        "**XML reasoning discipline (applies ONLY when you chose XML — skip this whole section if you're using Mermaid):** Your job in XML is declaring logical structure — nodes, edges, labels, groupings. Follow these steps in order: (1) **Decide `postLayout` FIRST, before writing any XML.** If the XML diagram is a flowchart, state diagram, decision tree, or any directional/hierarchical process diagram (which you should rarely be writing as XML — prefer Mermaid), you MUST pass `postLayout` — use `verticalFlow` by default, `horizontalFlow` when the flow is drawn left-to-right, `tree` for pure hierarchies. Other algorithms (`force`, `stress`, `radial`) apply to their respective diagram types — see the `postLayout` parameter description. Omit `postLayout` only when the layout carries hand-crafted meaning (swimlanes, containers, architecture, UML) — the typical reason you chose XML in the first place. When `postLayout` is set, your x/y coordinates only need to express rough direction; ELK re-lays out the vertices. (1b) **Whenever you set `postLayout` to `verticalFlow` or `horizontalFlow`, you MUST also pass `startNodeIds` and `endNodeIds`** — arrays of cell IDs for your Start/entry and End/terminator nodes (e.g. `startNodeIds: [\"start\"]`, `endNodeIds: [\"end\"]`, or `endNodeIds: [\"success\",\"rejected\"]` for multi-outcome flows). This is always required, not just when the flow has feedback edges — ELK's topological detection mis-picks whenever your flow has loops, multiple entry points, or disconnected components. You are the one who named the cells; it's trivial for you to list them, and guesswork on the server side is not. (2) Pick ONE concrete scenario on your first impulse and commit — do not pitch alternatives, do not flip-flop between approaches. (3) Use the rigid grid in the XML reference (`x = col*180 + 40`, `y = row*120 + 40`) without computing spacings, canvas dimensions, or overlap checks. (4) Never add `<Array as=\"points\">` waypoints or `exitX/exitY/entryX/entryY` — when postLayout runs, ELK sets them; otherwise drawio's edge router handles it. (5) Do NOT narrate in your reasoning: no \"building the diagram\", no column enumeration, no coordinate math in prose, no coordinate re-verification after placement. Go straight to XML.\n\n" +
+        "**XML reasoning discipline (applies ONLY when you chose XML — skip this whole section if you're using Mermaid):** Your job in XML is declaring logical structure — nodes, edges, labels, groupings. Follow these steps in order: (1) **Decide `postLayout` and `routing` FIRST, before writing any XML.** If the XML diagram is a flowchart, state diagram, decision tree, or any directional/hierarchical process diagram (which you should rarely be writing as XML — prefer Mermaid), you MUST pass `postLayout: \"elk\"` (add `direction: \"horizontal\"` when the flow is drawn left-to-right; it defaults to vertical). Omit `postLayout` only when the layout carries hand-crafted meaning (swimlanes, containers, architecture, UML) — the typical reason you chose XML in the first place. When `postLayout` is set, your x/y coordinates only need to express rough direction; ELK re-lays out the vertices. For those hand-placed diagrams where you omit `postLayout`, consider `routing: \"libavoid\"` — it leaves your positions untouched and only routes the edges around the boxes in clean right angles (set it whenever connectors would otherwise overlap or cut through shapes). Treat `postLayout` and `routing` as alternatives: ELK already routes its own edges, so if you set `postLayout: \"elk\"` do NOT also set `routing` (redundant); use `routing` only on a hand-placed layout where you are NOT re-laying-out with ELK. (2) Pick ONE concrete scenario on your first impulse and commit — do not pitch alternatives, do not flip-flop between approaches. (3) Use the rigid grid in the XML reference (`x = col*180 + 40`, `y = row*120 + 40`) without computing spacings, canvas dimensions, or overlap checks. (4) Never add `<Array as=\"points\">` waypoints or `exitX/exitY/entryX/entryY` — when postLayout or routing runs it sets them; otherwise drawio's edge router handles it. (5) Do NOT narrate in your reasoning: no \"building the diagram\", no column enumeration, no coordinate math in prose, no coordinate re-verification after placement. Go straight to XML.\n\n" +
         "**User preference override — XML only.** If the user expresses a preference for draw.io XML over Mermaid in any phrasing (examples: \"no mermaid\", \"skip mermaid\", \"use xml\", \"I want drawio format\", \"stop using mermaid\", \"give me the xml\", \"native drawio only\", etc.), from that point onward in the conversation you MUST use the `xml` parameter exclusively and MUST NOT use the `mermaid` parameter, even for diagram types where Mermaid would normally be preferable. This preference persists for the remainder of the conversation unless the user clearly reverses it (e.g. \"mermaid is fine again\"). When the preference is active, translate any diagram request — including flowcharts, sequence diagrams, ER diagrams, etc. — directly to well-formed mxGraphModel XML.\n\n" +
         "When using XML: IMPORTANT — the XML must be well-formed. Do NOT include ANY XML comments (<!-- -->) in the output.\n\n" +
         xmlReference +
@@ -6288,31 +6600,25 @@ export function createServer(html, options = {})
             "Mermaid.js diagram definition (e.g. 'graph TD\\n  A-->B'). Supports 26 diagram types — see the tool description for the full list. The diagram is parsed and laid out natively (no upstream mermaid runtime) and converted to draw.io format. Mutually exclusive with 'xml'."
           ),
         postLayout: z
-          .enum(["verticalFlow", "horizontalFlow", "tree", "force", "stress", "radial"])
+          .enum(["elk"])
           .optional()
           .describe(
-            "Optional client-side layout pass applied after the diagram renders, powered by ELK (Eclipse Layout Kernel). Vertices animate (morph) from the positions you supplied to the algorithm's layout — they are **replaced**, so only your edge topology survives. You are the judge of when a canonical layout will read better than the coordinates you wrote; set this whenever the diagram type fits one of the algorithms below:\n" +
-            "- `verticalFlow` (ELK layered, top-down): flowcharts, process diagrams, state diagrams, decision flows, pipelines drawn vertically, ER/class diagrams with clear parent→child direction.\n" +
-            "- `horizontalFlow` (ELK layered, left-to-right): sequence-of-steps pipelines drawn horizontally, swimlanes aligned L→R, any directional process where the layout is wider than tall.\n" +
-            "- `tree` (ELK mrtree): org charts, decision trees, taxonomies, file/folder hierarchies — pure tree structures with a single root.\n" +
-            "- `force` (ELK force-directed): network / topology diagrams without a clear hierarchy (peer-to-peer, social graphs, knowledge graphs).\n" +
-            "- `stress` (ELK stress majorization): small-to-mid general graphs where `force` looks too loose — usually tighter and more readable for 10-30 nodes without a root.\n" +
-            "- `radial` (ELK radial): concentric layers around a root (mind maps, centered ego networks, influence diagrams).\n" +
+            "Optional client-side ELK (Eclipse Layout Kernel) layered-flow pass applied after the diagram renders. The only value is `\"elk\"`. Vertices animate (morph) from the positions you supplied to the layered layout — they are **replaced**, so only your edge topology survives. Set it for directional/hierarchical diagrams: flowcharts, process diagrams, state diagrams, decision flows, pipelines, ER/class diagrams with clear parent→child direction. Flow direction (top-down vs left-to-right): for **Mermaid** it is taken from the flowchart code (`flowchart TD/TB` → top-down, `LR/RL` → left-to-right) — do not try to set it here; for **XML** set the optional `direction` field (defaults to top-down).\n" +
             "**Omit** for diagrams whose layout carries meaning you hand-crafted: swimlanes/pools, containers, architecture / deployment / network topology with grouped regions, P&ID or circuit schematics, floor plans, UML diagrams with deliberate placement.\n\n" +
-            "**For Mermaid flowcharts**, the native parser does its own layout, but it produces cramped or unbalanced output once the diagram has any structural complexity. Request `postLayout` whenever ANY of the following holds: ≥ ~20 nodes, OR ≥ 3 decision diamonds (`{...}` shapes), OR any feedback/back-edges (an edge that points to an earlier node, e.g. an error path looping back to a retry), OR ≥ 3 distinct endpoints. Pass `postLayout: \"verticalFlow\"` (for `flowchart TD/TB`) or `postLayout: \"horizontalFlow\"` (for `flowchart LR/RL`) along with `startNodeIds` and `endNodeIds` to re-layout via the same ELK algorithm draw.io's editor uses. **Exception: omit `horizontalFlow` whenever the source uses a `--- title: ... ---` frontmatter block — use `verticalFlow` or no postLayout instead.** ELK's `horizontalFlow` has no concept of a title and squashes it into the leftmost layer alongside the flow nodes, which crushes the actual diagram. `verticalFlow` is unaffected (the title sits in its own top row), so it remains a valid choice for titled top-down flowcharts. Skip for simple flowcharts (linear chains, < 20 nodes, no branching/back-edges) and for non-flowchart Mermaid types (sequence, class, ER, sankey, etc. — postLayout doesn't apply).\n\n" +
-            "**When you set this to `verticalFlow` or `horizontalFlow`, you MUST also provide `startNodeIds` and `endNodeIds`** so ELK knows which nodes belong in the first and last layers."
+            "**For Mermaid flowcharts**, the native parser does its own layout, but it produces cramped or unbalanced output once the diagram has any structural complexity. Request `postLayout: \"elk\"` whenever ANY of the following holds: ≥ ~20 nodes, OR ≥ 3 decision diamonds (`{...}` shapes), OR any feedback/back-edges (an edge that points to an earlier node, e.g. an error path looping back to a retry), OR ≥ 3 distinct endpoints — the flow direction follows the flowchart code, so you never pass `direction` for Mermaid. Skip for simple flowcharts (linear chains, < 20 nodes, no branching/back-edges) and for non-flowchart Mermaid types (sequence, class, ER, sankey, etc. — postLayout doesn't apply)."
           ),
-        startNodeIds: z
-          .array(z.string())
+        direction: z
+          .enum(["vertical", "horizontal"])
           .optional()
           .describe(
-            "**REQUIRED whenever `postLayout` is `verticalFlow` or `horizontalFlow`.** Cell IDs of start/entry nodes — pinned to the first layer (top for verticalFlow, left for horizontalFlow). Always pass this for layered flowcharts; do not rely on ELK's automatic source detection. You authored the cell IDs, so listing them is trivial. Example: a login flow with `<mxCell id=\"start\" value=\"Start\" ...>` should pass `startNodeIds: [\"start\"]`. Multiple entry points are allowed (e.g. `[\"manualStart\", \"scheduledStart\"]`)."
+            "**XML only** — the flow direction for `postLayout: \"elk\"` on XML diagrams: `vertical` (top-down) or `horizontal` (left-to-right). Defaults to `vertical`. **Ignored for Mermaid**, where direction is read from the flowchart code (`flowchart TD/TB` vs `LR/RL`). Only meaningful together with `postLayout: \"elk\"`."
           ),
-        endNodeIds: z
-          .array(z.string())
+        routing: z
+          .enum(["libavoid"])
           .optional()
           .describe(
-            "**REQUIRED whenever `postLayout` is `verticalFlow` or `horizontalFlow`.** Cell IDs of end/terminator nodes — pinned to the last layer (bottom for verticalFlow, right for horizontalFlow). Always pass this for layered flowcharts; do not rely on ELK's automatic sink detection. Example: `endNodeIds: [\"end\"]` for a single endpoint, or `endNodeIds: [\"success\", \"rejected\", \"expired\"]` for a multi-outcome flow."
+            "**XML only** — optional obstacle-avoiding orthogonal **edge-routing** pass (libavoid). The only value is `\"libavoid\"`. Unlike `postLayout`, this does **not** move any vertices — it keeps your hand-placed coordinates and only recomputes each edge's path so wires run in clean right-angle segments that route *around* the boxes instead of cutting through them. Set it for XML diagrams where you have placed nodes deliberately (architecture, network topology, deployment, swimlanes, UML, floor plans) and want tidy connectors without overlaps — exactly the diagrams where you'd OMIT `postLayout`.\n" +
+            "draw.io's default router is basic (straight or simple right-angle lines with **no obstacle avoidance** — wires cut straight through any box between the endpoints), so reach for `\"libavoid\"` whenever edges would otherwise cross shapes or you want uniformly clean orthogonal wiring on a layout you placed yourself. Think of `routing` and `postLayout` as **alternatives**: use `routing: \"libavoid\"` to keep your positions and only fix the wires, or `postLayout: \"elk\"` to re-lay-out the vertices — and note ELK already routes its edges decently, so when you use `postLayout` you normally should **not** also set `routing` (the combination is redundant in almost all cases). Do not add `<Array as=\"points\">` waypoints yourself when routing is set; libavoid computes them. **Ignored for Mermaid** (its native/ELK layout already routes)."
           ),
       },
       annotations:
@@ -6329,7 +6635,7 @@ export function createServer(html, options = {})
         "openai/toolInvocation/invoked": "Diagram ready.",
       },
     },
-    async function({ xml, mermaid, postLayout, startNodeIds, endNodeIds })
+    async function({ xml, mermaid, postLayout, direction, routing })
     {
       var hasXml = (xml != null && typeof xml === "string" && xml.trim().length > 0);
       var hasMermaid = (mermaid != null && typeof mermaid === "string" && mermaid.trim().length > 0);
@@ -6345,12 +6651,15 @@ export function createServer(html, options = {})
       // Mermaid path: return JSON for client-side conversion
       if (hasMermaid)
       {
+        var mermaidPayload = { mermaid: mermaid };
+        if (postLayout) mermaidPayload.postLayout = postLayout;
+        mermaidPayload._buildId = buildId;
         return {
-          content: [{ type: "text", text: JSON.stringify({ mermaid: mermaid, postLayout: postLayout || null, startNodeIds: startNodeIds || null, endNodeIds: endNodeIds || null, _version: getBuildVersion() }) }],
+          content: [{ type: "text", text: JSON.stringify(mermaidPayload) }],
         };
       }
 
-      // XML path: normalize, postprocess, validate
+      // XML path: normalize, validate
       var normalizedXml = normalizeDiagramXml(xml);
 
       if (!normalizedXml)
@@ -6362,21 +6671,16 @@ export function createServer(html, options = {})
         };
       }
 
-      // Server-side postprocess: xmldom normalization only (repairs
-      // malformed AI XML so mxCodec can decode it). ELK edge routing
-      // moved client-side — elkjs can't run in Cloudflare Workers.
-      try
-      {
-        var ppResult = await postprocessDiagramXml(normalizedXml);
-        normalizedXml = ppResult.xml;
-      }
-      catch (e)
-      {
-        // Postprocess fall-through: ship the un-postprocessed XML.
-      }
+      var xmlPayload = { xml: absolutizeImageUrls(normalizedXml) };
+      if (postLayout) xmlPayload.postLayout = postLayout;
+      // direction + routing are XML-only; Mermaid derives direction from the
+      // flowchart code and its layout already routes, so routing is omitted there.
+      if (direction) xmlPayload.direction = direction;
+      if (routing) xmlPayload.routing = routing;
+      xmlPayload._buildId = buildId;
 
       var content = [
-        { type: "text", text: JSON.stringify({ xml: normalizedXml, postLayout: postLayout || null, startNodeIds: startNodeIds || null, endNodeIds: endNodeIds || null, _version: getBuildVersion() }) }
+        { type: "text", text: JSON.stringify(xmlPayload) }
       ];
 
       // Validate and append warnings/errors so the LLM can self-correct
@@ -6416,14 +6720,17 @@ export function createServer(html, options = {})
         title: "Search Shapes",
         description:
           "Search the draw.io shape library by keywords. Returns matching shapes with " +
-          "their exact style strings, dimensions, and titles. Use ONLY for diagrams that " +
-          "need industry-specific or branded icons (cloud architecture, network topology, " +
-          "P&ID, electrical, Cisco, Kubernetes, BPMN). Do NOT use for standard diagram " +
-          "types like flowcharts, UML, ERD, org charts, or mind maps — these use basic " +
-          "geometric shapes (rectangles, diamonds, circles, cylinders) that are already " +
-          "covered in the XML reference. Also skip if the user asks to use basic/simple " +
-          "shapes or says not to search. The style string from the results can be " +
-          "used directly in mxCell style attributes.",
+          "their exact style strings, dimensions, and titles. Covers ~10,000 built-in " +
+          "stencils (cloud architecture, network topology, P&ID, electrical, Cisco, " +
+          "Kubernetes, BPMN) and, when those are sparse, supplements results with the " +
+          "draw.io icon service (brand/product logos and general-purpose concept icons, " +
+          "e.g. 'react', 'slack', 'shopping cart', 'solar panel'). Use ONLY for diagrams " +
+          "that need industry-specific, branded, or pictorial icons. Do NOT use for " +
+          "standard diagram types like flowcharts, UML, ERD, org charts, or mind maps — " +
+          "these use basic geometric shapes (rectangles, diamonds, circles, cylinders) " +
+          "that are already covered in the XML reference. Also skip if the user asks to " +
+          "use basic/simple shapes or says not to search. The style string from the " +
+          "results can be used directly in mxCell style attributes.",
         inputSchema:
         {
           query: z
@@ -6454,7 +6761,8 @@ export function createServer(html, options = {})
       async function({ query, limit })
       {
         var maxLimit = Math.min(limit || 10, 50);
-        var results = searchShapes(shapeIndex, tagMap, query, maxLimit);
+        var results = await searchShapesAndIcons(shapeIndex, tagMap, query,
+          maxLimit, { serviceUrl: iconServiceUrl });
 
         if (results.length === 0)
         {
@@ -6491,7 +6799,9 @@ export function createServer(html, options = {})
                 ...(domain ? { domain } : {}),
                 csp:
                 {
-                  resourceDomains: ["https://viewer.diagrams.net", "https://app.diagrams.net"],
+                  // icons.diagrams.net: remote icon images referenced by
+                  // search_shapes icon-service results (shape=image styles)
+                  resourceDomains: ["https://viewer.diagrams.net", "https://app.diagrams.net", "https://icons.diagrams.net"],
                   connectDomains: ["https://viewer.diagrams.net"],
                 },
               },
